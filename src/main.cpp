@@ -27,7 +27,8 @@ void handleMessage(AdafruitIO_Data *data) {
 }
 
 // Relay pin mapping (board: ESP32-S3-Relay-6CH)
-const uint8_t RELAY_PINS[6] = {1, 2, 41, 42, 45, 46};
+// Avoid GPIO1/GPIO3 (UART0) which are used for serial TX/RX
+const uint8_t RELAY_PINS[6] = {4, 5, 41, 42, 45, 46};
 AdafruitIO_Feed *relayFeeds[6];
 
 // Early boot printing task
@@ -45,9 +46,9 @@ Adafruit_NeoPixel strip(NUM_RGB, RGB_PIN, NEO_GRB + NEO_KHZ800);
 AdafruitIO_Feed *rgbFeed = nullptr;
 uint8_t current_r = 0, current_g = 0, current_b = 0;
 
-// DHT22 sensors (AM2302) on pins 14 and 13
-#define DHTPIN1 14
-#define DHTPIN2 13
+// DHT22 sensors (AM2302) on pins 15 and 16
+#define DHTPIN1 15
+#define DHTPIN2 16
 #define DHTTYPE DHT22
 DHT dht1(DHTPIN1, DHTTYPE);
 DHT dht2(DHTPIN2, DHTTYPE);
@@ -58,6 +59,8 @@ unsigned long lastDHT = 0;
 // Heartbeat interval (ms)
 const unsigned long HEARTBEAT_INTERVAL = 5000;
 unsigned long lastHeartbeat = 0;
+// Controla si el firmware cicla automáticamente los relays (false = deshabilitado)
+bool autoCycle = false;
 
 // Start early print task (creates task that watches `stopEarlyPrint`)
 void startEarlyBootPrints() {
@@ -125,6 +128,8 @@ void handleRelay6(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[5], data->toI
 
 // Serial command buffer and handler
 String serialLine = "";
+// Last WiFi scan result count (used by wscan/wjoin serial commands)
+int lastWiFiScanCount = 0;
 
 // Early print task: prints a short line every 200ms until stopEarlyPrint==true
 void earlyPrintTask(void *pvParameters) {
@@ -197,12 +202,123 @@ void handleSerialCommand(const String &cmd) {
     }
     return;
   }
+
+  // cycle on/off/status -> control del ciclo automático de relays
+  if (s.startsWith("cycle")) {
+    if (s == "cycle on") {
+      autoCycle = true;
+      Serial.println("Auto-cycle enabled");
+      return;
+    }
+    if (s == "cycle off") {
+      autoCycle = false;
+      Serial.println("Auto-cycle disabled");
+      return;
+    }
+    if (s == "cycle status") {
+      Serial.print("Auto-cycle: "); Serial.println(autoCycle ? "ON" : "OFF");
+      return;
+    }
+    Serial.println("Usage: cycle on|off|status");
+    return;
+  }
+
+  // wscan -> scan and list WiFi networks with indices
+  if (s == "wscan") {
+    Serial.println("Scanning for available WiFi networks...");
+    lastWiFiScanCount = WiFi.scanNetworks();
+    Serial.print(lastWiFiScanCount); Serial.println(" networks found:");
+    for (int i = 0; i < lastWiFiScanCount; ++i) {
+      Serial.print(i);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (RSSI "); Serial.print(WiFi.RSSI(i)); Serial.print(")");
+      if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) Serial.print(" *");
+      Serial.println();
+    }
+    // do not delete scan results so the user can use wjoin
+    return;
+  }
+
+  // wjoin <index> <password> -> join network from last scan with given index and password
+  if (s.startsWith("wjoin ")) {
+    // parse index and password (password may be empty for open networks)
+    int space = s.indexOf(' ');
+    String rest = s.substring(space + 1);
+    rest.trim();
+    int space2 = rest.indexOf(' ');
+    if (space2 < 0) {
+      Serial.println("Usage: wjoin <index> <password>   (use empty password for open networks)");
+      return;
+    }
+    String idxStr = rest.substring(0, space2);
+    String pass = rest.substring(space2 + 1);
+    int idx = idxStr.toInt();
+    if (lastWiFiScanCount <= 0) {
+      Serial.println("No previous scan results. Run 'wscan' first.");
+      return;
+    }
+    if (idx < 0 || idx >= lastWiFiScanCount) {
+      Serial.println("Invalid index. Run 'wscan' to see available networks.");
+      return;
+    }
+    String ssid = WiFi.SSID(idx);
+    Serial.print("Attempting to join '"); Serial.print(ssid); Serial.println("'...");
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long start = millis();
+    const unsigned long JOIN_TIMEOUT = 20000; // 20s
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < JOIN_TIMEOUT) {
+      Serial.print('.');
+      delay(500);
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
+      // reconnect Adafruit IO
+      io.connect();
+    } else {
+      Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
+      Serial.print("WiFi status="); Serial.println(WiFi.status());
+    }
+    return;
+  }
+
+  // wconnect <ssid> <password> -> immediate connect to given SSID (ssid without spaces)
+  if (s.startsWith("wconnect ")) {
+    int space = s.indexOf(' ');
+    String rest = s.substring(space + 1);
+    int space2 = rest.indexOf(' ');
+    if (space2 < 0) {
+      Serial.println("Usage: wconnect <ssid> <password>   (ssid without spaces)");
+      return;
+    }
+    String ssid = rest.substring(0, space2);
+    String pass = rest.substring(space2 + 1);
+    Serial.print("Attempting to join '"); Serial.print(ssid); Serial.println("'...");
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long start = millis();
+    const unsigned long JOIN_TIMEOUT = 20000; // 20s
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < JOIN_TIMEOUT) {
+      Serial.print('.');
+      delay(500);
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
+      io.connect();
+    } else {
+      Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
+      Serial.print("WiFi status="); Serial.println(WiFi.status());
+    }
+    return;
+  }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
 }
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Serial.println("Serial OK");
 
   // Start early-print task immediately so we get output right after reset
   stopEarlyPrint = false;
@@ -221,6 +337,51 @@ void setup() {
   startEarlyBootPrints();
 
   // Start the IO connection
+  // Attempt explicit WiFi connection first with timeout and diagnostics
+  Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long wifiStart = millis();
+  const unsigned long WIFI_TIMEOUT = 20000; // 20s timeout
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < WIFI_TIMEOUT) {
+    Serial.print('.');
+    delay(500);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.print("WiFi connect failed, status="); Serial.print(WiFi.status());
+    // Print human-readable status
+    auto wifiStatusToString = [](int s)->const char* {
+      switch (s) {
+        case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+        case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+        case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+        case WL_CONNECTED: return "WL_CONNECTED";
+        case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+        case WL_DISCONNECTED: return "WL_DISCONNECTED";
+        default: return "UNKNOWN";
+      }
+    };
+    Serial.print(" ("); Serial.print(wifiStatusToString(WiFi.status())); Serial.println(")");
+
+    // Provide a network scan to help diagnose if the SSID is available (2.4GHz vs 5GHz)
+    Serial.println("Scanning for available WiFi networks...");
+    int n = WiFi.scanNetworks();
+    Serial.print(n); Serial.println(" networks found:");
+    for (int i = 0; i < n; ++i) {
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (RSSI "); Serial.print(WiFi.RSSI(i)); Serial.print(")");
+      if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) Serial.print(" *");
+      Serial.println();
+    }
+    WiFi.scanDelete();
+  }
+
+  // Now connect to Adafruit IO (will use WiFi if available)
   io.connect();
 
   // Initialize DHT sensors
@@ -296,32 +457,34 @@ void loop() {
   }
 
   // Cycle through all 6 relays automatically for physical verification
-  static unsigned long lastCycleMillis = 0;
-  static int cycleIndex = 0;
-  static int cycleState = 0; // 0=off-wait, 1=on-wait
-  const unsigned long CYCLE_OFF_INTERVAL = 4000; // time between activations
-  const unsigned long CYCLE_ON_DURATION = 1000; // how long each relay stays on
-  unsigned long nowMillis = millis();
-  if (cycleState == 0) {
-    if (nowMillis - lastCycleMillis >= CYCLE_OFF_INTERVAL) {
-      // turn on current relay
-      int idx = cycleIndex;
-      digitalWrite(RELAY_PINS[idx], HIGH);
-      if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
-      Serial.print("Cycle: relay on "); Serial.println(idx+1);
-      cycleState = 1;
-      lastCycleMillis = nowMillis;
-    }
-  } else {
-    if (nowMillis - lastCycleMillis >= CYCLE_ON_DURATION) {
-      // turn off current relay and advance
-      int idx = cycleIndex;
-      digitalWrite(RELAY_PINS[idx], LOW);
-      if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
-      Serial.print("Cycle: relay off "); Serial.println(idx+1);
-      cycleIndex = (cycleIndex + 1) % 6;
-      cycleState = 0;
-      lastCycleMillis = nowMillis;
+  if (autoCycle) {
+    static unsigned long lastCycleMillis = 0;
+    static int cycleIndex = 0;
+    static int cycleState = 0; // 0=off-wait, 1=on-wait
+    const unsigned long CYCLE_OFF_INTERVAL = 4000; // time between activations
+    const unsigned long CYCLE_ON_DURATION = 1000; // how long each relay stays on
+    unsigned long nowMillis = millis();
+    if (cycleState == 0) {
+      if (nowMillis - lastCycleMillis >= CYCLE_OFF_INTERVAL) {
+        // turn on current relay
+        int idx = cycleIndex;
+        digitalWrite(RELAY_PINS[idx], HIGH);
+        if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+        Serial.print("Cycle: relay on "); Serial.println(idx+1);
+        cycleState = 1;
+        lastCycleMillis = nowMillis;
+      }
+    } else {
+      if (nowMillis - lastCycleMillis >= CYCLE_ON_DURATION) {
+        // turn off current relay and advance
+        int idx = cycleIndex;
+        digitalWrite(RELAY_PINS[idx], LOW);
+        if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+        Serial.print("Cycle: relay off "); Serial.println(idx+1);
+        cycleIndex = (cycleIndex + 1) % 6;
+        cycleState = 0;
+        lastCycleMillis = nowMillis;
+      }
     }
   }
 
