@@ -3,6 +3,11 @@
 #include "AdafruitIO_WiFi.h"
 #include "AdafruitIO_Feed.h"
 #include <Adafruit_NeoPixel.h>
+#include <DHT.h>
+#include <WiFi.h>
+// FreeRTOS for early printing task
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // Initialize the Adafruit IO WiFi client
 AdafruitIO_WiFi io(AIO_USERNAME, AIO_KEY, WIFI_SSID, WIFI_PASS);
@@ -25,12 +30,49 @@ void handleMessage(AdafruitIO_Data *data) {
 const uint8_t RELAY_PINS[6] = {1, 2, 41, 42, 45, 46};
 AdafruitIO_Feed *relayFeeds[6];
 
+// Early boot printing task
+TaskHandle_t earlyPrintTaskHandle = NULL;
+volatile bool stopEarlyPrint = false;
+
+// forward declaration for task function
+void earlyPrintTask(void *pvParameters);
+
+
 // WS2812 (NeoPixel) RGB LED on GPIO38
 #define RGB_PIN 38
 #define NUM_RGB 1
 Adafruit_NeoPixel strip(NUM_RGB, RGB_PIN, NEO_GRB + NEO_KHZ800);
 AdafruitIO_Feed *rgbFeed = nullptr;
 uint8_t current_r = 0, current_g = 0, current_b = 0;
+
+// DHT22 sensors (AM2302) on pins 14 and 13
+#define DHTPIN1 14
+#define DHTPIN2 13
+#define DHTTYPE DHT22
+DHT dht1(DHTPIN1, DHTTYPE);
+DHT dht2(DHTPIN2, DHTTYPE);
+
+// DHT read interval (ms)
+const unsigned long DHT_INTERVAL = 15000;
+unsigned long lastDHT = 0;
+// Heartbeat interval (ms)
+const unsigned long HEARTBEAT_INTERVAL = 5000;
+unsigned long lastHeartbeat = 0;
+
+// Start early print task (creates task that watches `stopEarlyPrint`)
+void startEarlyBootPrints() {
+  if (earlyPrintTaskHandle == NULL) {
+    stopEarlyPrint = false;
+    xTaskCreatePinnedToCore(earlyPrintTask, "earlyPrint", 2048, NULL, 1, &earlyPrintTaskHandle, 1);
+  }
+}
+
+// Stop early print task by setting the flag; task exits and deletes itself
+void stopEarlyBootPrints() {
+  if (earlyPrintTaskHandle != NULL) {
+    stopEarlyPrint = true;
+  }
+}
 
 // Helper: publish current RGB as #RRGGBB
 void publishRGB() {
@@ -81,13 +123,110 @@ void handleRelay4(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[3], data->toI
 void handleRelay5(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[4], data->toInt() ? HIGH : LOW); relayFeeds[4]->save(digitalRead(RELAY_PINS[4])); Serial.println("relay5 updated"); }
 void handleRelay6(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[5], data->toInt() ? HIGH : LOW); relayFeeds[5]->save(digitalRead(RELAY_PINS[5])); Serial.println("relay6 updated"); }
 
+// Serial command buffer and handler
+String serialLine = "";
+
+// Early print task: prints a short line every 200ms until stopEarlyPrint==true
+void earlyPrintTask(void *pvParameters) {
+  (void)pvParameters;
+  while (!stopEarlyPrint) {
+    Serial.println("[BOOT] initializing...");
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  vTaskDelete(NULL);
+}
+
+// Handle serial commands like "r5 1" to set relay 5 on/off
+void handleSerialCommand(const String &cmd) {
+  String s = cmd;
+  s.trim();
+  s.toLowerCase();
+  if (s.length() == 0) return;
+  // rN V  -> set relay N to 0/1
+  if (s.charAt(0) == 'r' && s.length() > 1 && isDigit(s.charAt(1))) {
+    int space = s.indexOf(' ');
+    if (space <= 1) {
+      Serial.println("Invalid command. Use: r<N> <0|1>");
+      return;
+    }
+    String numStr = s.substring(1, space);
+    String valStr = s.substring(space + 1);
+    int relayNum = numStr.toInt();
+    int val = valStr.toInt();
+    if (relayNum < 1 || relayNum > 6 || (val != 0 && val != 1)) {
+      Serial.println("Invalid relay number/value");
+      return;
+    }
+    int idx = relayNum - 1;
+    digitalWrite(RELAY_PINS[idx], val ? HIGH : LOW);
+    int readBack = digitalRead(RELAY_PINS[idx]);
+    if (relayFeeds[idx]) relayFeeds[idx]->save(readBack);
+    Serial.print("Serial: set relay "); Serial.print(relayNum);
+    Serial.print(" -> "); Serial.print(val);
+    Serial.print(" (pin "); Serial.print(RELAY_PINS[idx]); Serial.print(") read="); Serial.println(readBack);
+    return;
+  }
+
+  // trN -> transient toggle (pulse) relay N for 500ms
+  if (s.startsWith("tr") && s.length() > 2 && isDigit(s.charAt(2))) {
+    String numStr = s.substring(2);
+    int relayNum = numStr.toInt();
+    if (relayNum < 1 || relayNum > 6) {
+      Serial.println("Invalid relay number for trN");
+      return;
+    }
+    int idx = relayNum - 1;
+    int before = digitalRead(RELAY_PINS[idx]);
+    digitalWrite(RELAY_PINS[idx], !before);
+    Serial.print("Serial: pulse relay "); Serial.print(relayNum); Serial.println(" (on temporary)");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    digitalWrite(RELAY_PINS[idx], before);
+    int after = digitalRead(RELAY_PINS[idx]);
+    if (relayFeeds[idx]) relayFeeds[idx]->save(after);
+    Serial.print("Serial: pulse done relay "); Serial.print(relayNum);
+    Serial.print(" read="); Serial.println(after);
+    return;
+  }
+
+  // rs -> report relay states
+  if (s == "rs") {
+    Serial.println("Relay states:");
+    for (int i = 0; i < 6; i++) {
+      Serial.print("r"); Serial.print(i+1); Serial.print(" (pin "); Serial.print(RELAY_PINS[i]); Serial.print(") = ");
+      Serial.println(digitalRead(RELAY_PINS[i]));
+    }
+    return;
+  }
+  Serial.print("Unknown serial command: "); Serial.println(cmd);
+}
+
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  Serial.begin(115200);
+  Serial.begin(9600);
+
+  // Start early-print task immediately so we get output right after reset
+  stopEarlyPrint = false;
+  xTaskCreatePinnedToCore(earlyPrintTask, "earlyPrint", 2048, NULL, 1, &earlyPrintTaskHandle, 1);
+
   delay(100);
+
+  // Early boot banner: printed immediately after Serial.begin()
+  Serial.println();
+  Serial.println("=== ESP32-S3 Relay-6CH Firmware ===");
+  Serial.print("Build: "); Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
+  Serial.print("AIO user: "); Serial.println(AIO_USERNAME);
+  Serial.println("Starting...\n");
+
+  // Start frequent early prints while setup continues
+  startEarlyBootPrints();
 
   // Start the IO connection
   io.connect();
+
+  // Initialize DHT sensors
+  dht1.begin();
+  dht2.begin();
+  Serial.println("DHT sensors initialized");
 
   // Attach a message handler to the feed
   ledFeed->onMessage(handleMessage);
@@ -118,11 +257,73 @@ void setup() {
   rgbFeed->onMessage(handleRGB);
   // publish initial rgb
   publishRGB();
+
+  // Signal the early-print task to stop and give it a short time to exit
+  stopEarlyPrint = true;
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  // Stop early boot prints now that initialization finished
+  stopEarlyBootPrints();
 }
 
 void loop() {
+  // Read serial input (non-blocking) and process commands
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      String cmd = serialLine;
+      cmd.trim();
+      if (cmd.length() > 0) handleSerialCommand(cmd);
+      serialLine = "";
+    } else {
+      serialLine += c;
+      if (serialLine.length() > 64) serialLine = serialLine.substring(serialLine.length() - 64);
+    }
+  }
+
   // Required to maintain the connection to Adafruit IO
   io.run();
+
+  // Visible indicators for physical verification
+  static unsigned long lastBlink = 0;
+  static bool blinkState = false;
+  const unsigned long BLINK_INTERVAL = 500;
+  if (millis() - lastBlink > BLINK_INTERVAL) {
+    lastBlink = millis();
+    blinkState = !blinkState;
+    digitalWrite(LED_BUILTIN, blinkState ? HIGH : LOW);
+  }
+
+  // Cycle through all 6 relays automatically for physical verification
+  static unsigned long lastCycleMillis = 0;
+  static int cycleIndex = 0;
+  static int cycleState = 0; // 0=off-wait, 1=on-wait
+  const unsigned long CYCLE_OFF_INTERVAL = 4000; // time between activations
+  const unsigned long CYCLE_ON_DURATION = 1000; // how long each relay stays on
+  unsigned long nowMillis = millis();
+  if (cycleState == 0) {
+    if (nowMillis - lastCycleMillis >= CYCLE_OFF_INTERVAL) {
+      // turn on current relay
+      int idx = cycleIndex;
+      digitalWrite(RELAY_PINS[idx], HIGH);
+      if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+      Serial.print("Cycle: relay on "); Serial.println(idx+1);
+      cycleState = 1;
+      lastCycleMillis = nowMillis;
+    }
+  } else {
+    if (nowMillis - lastCycleMillis >= CYCLE_ON_DURATION) {
+      // turn off current relay and advance
+      int idx = cycleIndex;
+      digitalWrite(RELAY_PINS[idx], LOW);
+      if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+      Serial.print("Cycle: relay off "); Serial.println(idx+1);
+      cycleIndex = (cycleIndex + 1) % 6;
+      cycleState = 0;
+      lastCycleMillis = nowMillis;
+    }
+  }
 
   // Example: publish a random value every 10s
   static unsigned long last = 0;
@@ -132,5 +333,41 @@ void loop() {
     Serial.print("Publishing: ");
     Serial.println(value);
     ledFeed->save(value);
+  }
+
+  // Read DHT sensors and print status every DHT_INTERVAL
+  if (millis() - lastDHT > DHT_INTERVAL) {
+    lastDHT = millis();
+    Serial.println("--- Status & DHT readings ---");
+    // Board status
+    Serial.print("Uptime (s): "); Serial.println(millis() / 1000);
+    Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
+    Serial.print("WiFi IP: ");
+    if (WiFi.status() == WL_CONNECTED) Serial.println(WiFi.localIP()); else Serial.println("not connected");
+
+    // Sensor 1
+    float h1 = dht1.readHumidity();
+    float t1 = dht1.readTemperature();
+    if (isnan(h1) || isnan(t1)) {
+      Serial.println("Sensor DHT1 (pin 14) read failed");
+    } else {
+      Serial.print("DHT1 (14) - Temp: "); Serial.print(t1); Serial.print(" *C, Humidity: "); Serial.print(h1); Serial.println(" %");
+    }
+
+    // Sensor 2
+    float h2 = dht2.readHumidity();
+    float t2 = dht2.readTemperature();
+    if (isnan(h2) || isnan(t2)) {
+      Serial.println("Sensor DHT2 (pin 13) read failed");
+    } else {
+      Serial.print("DHT2 (13) - Temp: "); Serial.print(t2); Serial.print(" *C, Humidity: "); Serial.print(h2); Serial.println(" %");
+    }
+    Serial.println("-----------------------------");
+  }
+  // Heartbeat: print alive every HEARTBEAT_INTERVAL
+  if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
+    lastHeartbeat = millis();
+    Serial.print("[HEARTBEAT] alive, uptime(s): ");
+    Serial.println(millis() / 1000);
   }
 }
