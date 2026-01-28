@@ -393,6 +393,19 @@ void handleSerialCommand(const String &cmd) {
     Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
     return;
   }
+
+  // wclear -> remove stored WiFi credentials from Preferences and start portal
+  if (s == "wclear") {
+    Serial.println("Clearing stored WiFi credentials...");
+    prefs.begin("wifi", false);
+    prefs.remove("ssid");
+    prefs.remove("pass");
+    prefs.end();
+    Serial.println("Credentials removed from NVS.");
+    startConfigPortal();
+    Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
+    return;
+  }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
 }
 
