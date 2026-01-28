@@ -5,6 +5,8 @@
 #include <Adafruit_NeoPixel.h>
 #include <DHT.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 // FreeRTOS for early printing task
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -130,6 +132,78 @@ void handleRelay6(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[5], data->toI
 String serialLine = "";
 // Last WiFi scan result count (used by wscan/wjoin serial commands)
 int lastWiFiScanCount = 0;
+
+// Configuration portal state
+Preferences prefs;
+WebServer configServer(80);
+bool configPortalActive = false;
+int configScanCount = 0;
+
+// Forward declarations
+void startConfigPortal();
+void stopConfigPortal();
+
+// Web handlers
+void handlePortalRoot() {
+  String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
+  html += "<h3>ESP32 WiFi Setup</h3>";
+  html += "<form method=\"POST\" action=\"/save\">SSID:<br><select name=\"ssid\">";
+  for (int i = 0; i < configScanCount; ++i) {
+    html += "<option value=\"" + WiFi.SSID(i) + "\">" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + ")" + "</option>";
+  }
+  html += "</select><br>Password:<br><input name=\"pass\" type=\"password\"><br><br><input type=\"submit\" value=\"Save & Connect\"></form>";
+  html += "<p>Use serial command 'wscan' to refresh network list from serial.</p>";
+  html += "</body></html>";
+  configServer.send(200, "text/html", html);
+}
+
+void handlePortalSave() {
+  if (configServer.hasArg("ssid")) {
+    String ssid = configServer.arg("ssid");
+    String pass = configServer.arg("pass");
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    String resp = "<html><body><h3>Saved credentials. Attempting to connect...</h3><p>The device will try to connect to: " + ssid + "</p></body></html>";
+    configServer.send(200, "text/html", resp);
+    // attempt connect (non-blocking: stop portal and let loop attempt)
+    stopConfigPortal();
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    delay(100);
+  } else {
+    configServer.send(400, "text/plain", "Missing SSID");
+  }
+}
+
+void startConfigPortal() {
+  if (configPortalActive) return;
+  Serial.println("Starting WiFi config portal (AP mode)");
+  // create soft AP
+  const char *apName = "ESP32-Setup";
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(apName);
+  delay(200);
+  // scan networks for selection
+  configScanCount = WiFi.scanNetworks();
+  // start web server
+  configServer.on("/", handlePortalRoot);
+  configServer.on("/save", HTTP_POST, handlePortalSave);
+  configServer.begin();
+  configPortalActive = true;
+  Serial.print("Config portal started at "); Serial.println(WiFi.softAPIP());
+}
+
+void stopConfigPortal() {
+  if (!configPortalActive) return;
+  Serial.println("Stopping config portal");
+  configServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  configPortalActive = false;
+}
 
 // Early print task: prints a short line every 200ms until stopEarlyPrint==true
 void earlyPrintTask(void *pvParameters) {
@@ -312,6 +386,13 @@ void handleSerialCommand(const String &cmd) {
     }
     return;
   }
+
+  // wportal -> start config portal (AP + webserver) to configure WiFi via browser
+  if (s == "wportal") {
+    startConfigPortal();
+    Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
+    return;
+  }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
 }
 
@@ -338,8 +419,21 @@ void setup() {
 
   // Start the IO connection
   // Attempt explicit WiFi connection first with timeout and diagnostics
-  Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Try to read stored credentials from Preferences first
+  String stored_ssid = "";
+  String stored_pass = "";
+  prefs.begin("wifi", true);
+  stored_ssid = prefs.getString("ssid", "");
+  stored_pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (stored_ssid.length() > 0) {
+    Serial.print("Connecting to WiFi '"); Serial.print(stored_ssid); Serial.println("' (stored creds)");
+    WiFi.begin(stored_ssid.c_str(), stored_pass.c_str());
+  } else {
+    Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
   unsigned long wifiStart = millis();
   const unsigned long WIFI_TIMEOUT = 20000; // 20s timeout
   while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < WIFI_TIMEOUT) {
@@ -369,16 +463,19 @@ void setup() {
     // Provide a network scan to help diagnose if the SSID is available (2.4GHz vs 5GHz)
     Serial.println("Scanning for available WiFi networks...");
     int n = WiFi.scanNetworks();
+    lastWiFiScanCount = n;
     Serial.print(n); Serial.println(" networks found:");
     for (int i = 0; i < n; ++i) {
-      Serial.print(i + 1);
+      Serial.print(i);
       Serial.print(": ");
       Serial.print(WiFi.SSID(i));
       Serial.print(" (RSSI "); Serial.print(WiFi.RSSI(i)); Serial.print(")");
       if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) Serial.print(" *");
       Serial.println();
     }
-    WiFi.scanDelete();
+    // Start config portal so user can configure via WiFi if desired
+    Serial.println("Starting configuration portal. Use serial 'wportal' to start later or connect to the AP.");
+    startConfigPortal();
   }
 
   // Now connect to Adafruit IO (will use WiFi if available)
@@ -445,6 +542,11 @@ void loop() {
 
   // Required to maintain the connection to Adafruit IO
   io.run();
+
+  // If config portal active, handle web clients
+  if (configPortalActive) {
+    configServer.handleClient();
+  }
 
   // Visible indicators for physical verification
   static unsigned long lastBlink = 0;
