@@ -35,3 +35,20 @@ Read more about using header files in official GCC documentation:
 * Computed Includes
 
 https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+
+Security note:
+
+- Do NOT commit `include/credentials.h` to source control. It contains
+	private WiFi and Adafruit IO keys.
+- Keep a local `include/credentials.h` file (ignored by Git) with your
+	real values and commit `include/credentials.example.h` instead.
+- To avoid storing secrets in files, consider using environment variables
+	or the platform's secret storage (for CI or cloud builds).
+
+Example local setup:
+
+1. Copy the example:
+
+	 cp include/credentials.example.h include/credentials.h
+
+2. Edit `include/credentials.h` and fill your credentials.
