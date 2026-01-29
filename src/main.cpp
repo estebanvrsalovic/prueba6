@@ -659,7 +659,11 @@ void loop() {
     int value = random(0, 2);
     Serial.print("Publishing: ");
     Serial.println(value);
-    ledFeed->save(value);
+    if (io.isConnected()) {
+      ledFeed->save(value);
+    } else {
+      Serial.println("Publish skipped: Adafruit IO not connected");
+    }
   }
 
   // Read DHT sensors and print status every DHT_INTERVAL
