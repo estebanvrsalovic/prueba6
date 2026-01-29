@@ -180,6 +180,29 @@ bool tryConnectWiFiOnce() {
   return false;
 }
 
+// WiFi event handler: log events and attempt reconnects
+void onWiFiEvent(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.print("Event: GOT IP -> "); Serial.println(WiFi.localIP());
+    wifiRetryCount = 0;
+    lastWiFiAttempt = millis();
+  } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.println("Event: WIFI STA Disconnected");
+    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+    if (!configPortalActive) {
+      if (wifiRetryCount < WIFI_MAX_RETRIES) {
+        Serial.println("Event: attempting WiFi reconnect...");
+        wifiRetryCount++;
+        lastWiFiAttempt = millis();
+        WiFi.reconnect();
+      } else {
+        Serial.println("Event: max WiFi retries reached, starting config portal");
+        startConfigPortal();
+      }
+    }
+  }
+}
+
 // Forward declarations
 void startConfigPortal();
 void stopConfigPortal();
@@ -462,21 +485,11 @@ void setup() {
   // Attempt explicit WiFi connection first with timeout and diagnostics
   // Attempt connection and, on failure, start the config portal
   bool connected = tryConnectWiFiOnce();
+  // register WiFi event handler to follow disconnects/reconnects
+  WiFi.onEvent(onWiFiEvent);
   if (!connected) {
     Serial.println();
     // Print human-readable status
-    auto wifiStatusToString = [](int s)->const char* {
-      switch (s) {
-        case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
-        case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
-        case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
-        case WL_CONNECTED: return "WL_CONNECTED";
-        case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
-        case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
-        case WL_DISCONNECTED: return "WL_DISCONNECTED";
-        default: return "UNKNOWN";
-      }
-    };
     Serial.print("WiFi connect failed, status="); Serial.print(WiFi.status());
     // Print human-readable status
     auto wifiStatusToString = [](int s)->const char* {
@@ -509,7 +522,6 @@ void setup() {
     // Start config portal so user can configure via WiFi if desired
     Serial.println("Starting configuration portal. Use serial 'wportal' to start later or connect to the AP.");
     startConfigPortal();
-  }
   }
 
   // Now connect to Adafruit IO (will use WiFi if available)
@@ -664,18 +676,18 @@ void loop() {
     float h1 = dht1.readHumidity();
     float t1 = dht1.readTemperature();
     if (isnan(h1) || isnan(t1)) {
-      Serial.println("Sensor DHT1 (pin 14) read failed");
+      Serial.print("Sensor DHT1 (pin "); Serial.print(DHTPIN1); Serial.println(") read failed");
     } else {
-      Serial.print("DHT1 (14) - Temp: "); Serial.print(t1); Serial.print(" *C, Humidity: "); Serial.print(h1); Serial.println(" %");
+      Serial.print("DHT1 ("); Serial.print(DHTPIN1); Serial.print(") - Temp: "); Serial.print(t1); Serial.print(" *C, Humidity: "); Serial.print(h1); Serial.println(" %");
     }
 
     // Sensor 2
     float h2 = dht2.readHumidity();
     float t2 = dht2.readTemperature();
     if (isnan(h2) || isnan(t2)) {
-      Serial.println("Sensor DHT2 (pin 13) read failed");
+      Serial.print("Sensor DHT2 (pin "); Serial.print(DHTPIN2); Serial.println(") read failed");
     } else {
-      Serial.print("DHT2 (13) - Temp: "); Serial.print(t2); Serial.print(" *C, Humidity: "); Serial.print(h2); Serial.println(" %");
+      Serial.print("DHT2 ("); Serial.print(DHTPIN2); Serial.print(") - Temp: "); Serial.print(t2); Serial.print(" *C, Humidity: "); Serial.print(h2); Serial.println(" %");
     }
     Serial.println("-----------------------------");
   }
