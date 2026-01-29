@@ -208,12 +208,31 @@ void onWiFiEvent(WiFiEvent_t event) {
 }
 
 // Web handlers
+// Escape string for HTML output (basic)
+String escapeHTML(const String &s) {
+  String out = "";
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s.charAt(i);
+    switch (c) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += c; break;
+    }
+  }
+  return out;
+}
+
 void handlePortalRoot() {
   String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
   html += "<h3>ESP32 WiFi Setup</h3>";
   html += "<form method=\"POST\" action=\"/save\">SSID:<br><select name=\"ssid\">";
   for (int i = 0; i < configScanCount; ++i) {
-    html += "<option value=\"" + WiFi.SSID(i) + "\">" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + ")" + "</option>";
+    String ssid = WiFi.SSID(i);
+    String esc = escapeHTML(ssid);
+    html += "<option value=\"" + esc + "\">" + esc + " (" + String(WiFi.RSSI(i)) + ")" + "</option>";
   }
   html += "</select><br>Password:<br><input name=\"pass\" type=\"password\"><br><br><input type=\"submit\" value=\"Save & Connect\"></form>";
   html += "<p>Use serial command 'wscan' to refresh network list from serial.</p>";
