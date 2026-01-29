@@ -180,6 +180,10 @@ bool tryConnectWiFiOnce() {
   return false;
 }
 
+// Forward declarations
+void startConfigPortal();
+void stopConfigPortal();
+
 // WiFi event handler: log events and attempt reconnects
 void onWiFiEvent(WiFiEvent_t event) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
@@ -202,10 +206,6 @@ void onWiFiEvent(WiFiEvent_t event) {
     }
   }
 }
-
-// Forward declarations
-void startConfigPortal();
-void stopConfigPortal();
 
 // Web handlers
 void handlePortalRoot() {
