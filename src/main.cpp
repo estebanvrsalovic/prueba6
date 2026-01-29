@@ -139,6 +139,47 @@ WebServer configServer(80);
 bool configPortalActive = false;
 int configScanCount = 0;
 
+// WiFi reconnect helpers
+const unsigned long WIFI_INIT_TIMEOUT = 20000; // ms to wait for a connect attempt
+const unsigned long WIFI_RETRY_INTERVAL = 30000; // ms between automatic retries
+const int WIFI_MAX_RETRIES = 3;
+unsigned long lastWiFiAttempt = 0;
+int wifiRetryCount = 0;
+
+// Try to connect using stored creds (if present) or defaults. Returns true if connected.
+bool tryConnectWiFiOnce() {
+  String stored_ssid = "";
+  String stored_pass = "";
+  prefs.begin("wifi", true);
+  stored_ssid = prefs.getString("ssid", "");
+  stored_pass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (stored_ssid.length() > 0) {
+    Serial.print("Connecting to WiFi '"); Serial.print(stored_ssid); Serial.println("' (stored creds)");
+    WiFi.begin(stored_ssid.c_str(), stored_pass.c_str());
+  } else {
+    Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_INIT_TIMEOUT) {
+    Serial.print('.');
+    delay(500);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
+    wifiRetryCount = 0;
+    lastWiFiAttempt = millis();
+    return true;
+  }
+  Serial.print("WiFi connect failed, status="); Serial.println(WiFi.status());
+  lastWiFiAttempt = millis();
+  wifiRetryCount++;
+  return false;
+}
+
 // Forward declarations
 void startConfigPortal();
 void stopConfigPortal();
@@ -393,19 +434,6 @@ void handleSerialCommand(const String &cmd) {
     Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
     return;
   }
-
-  // wclear -> remove stored WiFi credentials from Preferences and start portal
-  if (s == "wclear") {
-    Serial.println("Clearing stored WiFi credentials...");
-    prefs.begin("wifi", false);
-    prefs.remove("ssid");
-    prefs.remove("pass");
-    prefs.end();
-    Serial.println("Credentials removed from NVS.");
-    startConfigPortal();
-    Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
-    return;
-  }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
 }
 
@@ -432,31 +460,23 @@ void setup() {
 
   // Start the IO connection
   // Attempt explicit WiFi connection first with timeout and diagnostics
-  // Try to read stored credentials from Preferences first
-  String stored_ssid = "";
-  String stored_pass = "";
-  prefs.begin("wifi", true);
-  stored_ssid = prefs.getString("ssid", "");
-  stored_pass = prefs.getString("pass", "");
-  prefs.end();
-
-  if (stored_ssid.length() > 0) {
-    Serial.print("Connecting to WiFi '"); Serial.print(stored_ssid); Serial.println("' (stored creds)");
-    WiFi.begin(stored_ssid.c_str(), stored_pass.c_str());
-  } else {
-    Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-  }
-  unsigned long wifiStart = millis();
-  const unsigned long WIFI_TIMEOUT = 20000; // 20s timeout
-  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < WIFI_TIMEOUT) {
-    Serial.print('.');
-    delay(500);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
-  } else {
+  // Attempt connection and, on failure, start the config portal
+  bool connected = tryConnectWiFiOnce();
+  if (!connected) {
     Serial.println();
+    // Print human-readable status
+    auto wifiStatusToString = [](int s)->const char* {
+      switch (s) {
+        case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+        case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+        case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+        case WL_CONNECTED: return "WL_CONNECTED";
+        case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+        case WL_DISCONNECTED: return "WL_DISCONNECTED";
+        default: return "UNKNOWN";
+      }
+    };
     Serial.print("WiFi connect failed, status="); Serial.print(WiFi.status());
     // Print human-readable status
     auto wifiStatusToString = [](int s)->const char* {
@@ -489,6 +509,7 @@ void setup() {
     // Start config portal so user can configure via WiFi if desired
     Serial.println("Starting configuration portal. Use serial 'wportal' to start later or connect to the AP.");
     startConfigPortal();
+  }
   }
 
   // Now connect to Adafruit IO (will use WiFi if available)
@@ -559,6 +580,22 @@ void loop() {
   // If config portal active, handle web clients
   if (configPortalActive) {
     configServer.handleClient();
+  }
+
+  // If not connected, try periodic reconnects and fall back to config portal
+  if (WiFi.status() != WL_CONNECTED && !configPortalActive) {
+    if ((millis() - lastWiFiAttempt) >= WIFI_RETRY_INTERVAL) {
+      if (wifiRetryCount < WIFI_MAX_RETRIES) {
+        Serial.println("WiFi disconnected, attempting reconnect...");
+        bool ok = tryConnectWiFiOnce();
+        if (ok) {
+          io.connect();
+        }
+      } else {
+        Serial.println("WiFi failed after retries; starting config portal.");
+        startConfigPortal();
+      }
+    }
   }
 
   // Visible indicators for physical verification
