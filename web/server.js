@@ -58,8 +58,15 @@ io.on('connection', (socket) => {
       const value = String(cmd.value);
       const topic = `esp32s3/command/relay${relay}`;
       console.log('Publishing command to MQTT', topic, value);
-      client.publish(topic, value);
-      socket.emit('command-ack', { relay, value });
+      // publish and acknowledge on publish callback
+      client.publish(topic, value, { qos: 0 }, (err) => {
+        if (err) {
+          console.error('Publish error', err);
+          socket.emit('command-error', { error: err.toString() });
+        } else {
+          socket.emit('command-ack', { relay, value });
+        }
+      });
     } catch (e) {
       console.error('Failed to publish command', e);
       socket.emit('command-error', { error: e.toString() });
@@ -100,7 +107,11 @@ client.on('message', (topic, message) => {
     io.emit('telemetry', obj);
   } else if (topic.startsWith('esp32s3/state/')) {
     const parts = topic.split('/');
-    const relay = parts[parts.length-1];
+    let relay = parts[parts.length-1];
+    // normalize relay id: 'relay1' -> '1'
+    if (typeof relay === 'string' && relay.startsWith('relay')) {
+      relay = relay.substring('relay'.length);
+    }
     io.emit('relay-state', { relay, state: payload });
   } else {
     // other topics

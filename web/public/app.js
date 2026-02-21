@@ -67,9 +67,11 @@ socket.on('telemetry', (data) => {
 });
 
 socket.on('relay-state', (obj) => {
-  const relay = obj.relay;
+  let relay = obj.relay;
+  // accept either 'relay1' or '1'
+  if (typeof relay === 'string' && relay.startsWith('relay')) relay = relay.substring('relay'.length);
   const state = String(obj.state);
-  relayStates[relay] = state;
+  relayStates[String(relay)] = state;
   updateRelays();
   rawEl.textContent = `state ${relay}: ${state}` + '\n' + rawEl.textContent;
 });
