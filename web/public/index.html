@@ -5,12 +5,16 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ESP32-S3 Telemetry</title>
   <style>
-    body{font-family:Arial,Helvetica,sans-serif;margin:16px}
-    pre{background:#111;color:#9f9;padding:12px}
-    .box{border:1px solid #ddd;padding:12px;margin-bottom:12px}
-    .relay{display:inline-block;padding:6px 10px;margin:4px;border-radius:4px;background:#eee}
-    .on{background:#9f9}
-    .off{background:#f99}
+    /* Light theme */
+    body{font-family:Arial,Helvetica,sans-serif;margin:16px;background:#ffffff;color:#111}
+    pre{background:#f7f7f7;color:#111;padding:12px;border:1px solid #e3e3e3;border-radius:4px}
+    .box{border:1px solid #e0e0e0;background:#ffffff;padding:12px;margin-bottom:12px;border-radius:6px;box-shadow:0 1px 2px rgba(0,0,0,0.03)}
+    .relay{display:inline-block;padding:6px 10px;margin:4px;border-radius:4px;background:#f1f1f1;color:#111}
+    .on{background:#d4f8d4}
+    .off{background:#ffd6d6}
+    /* Charts: smaller height and responsive container */
+    .charts-grid canvas{height:100px !important;max-height:140px;width:100% !important}
+    @media (max-width:600px){ .charts-grid canvas{height:90px !important} }
   </style>
 </head>
 <body>
@@ -22,22 +26,22 @@
   </div>
   <div class="box">
     <h4>Telemetry graphs</h4>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div class="charts-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
       <div>
         <h5>Sensor 1 - Temperature</h5>
-        <canvas id="chart-t1" height="150"></canvas>
+        <canvas id="chart-t1" height="100"></canvas>
       </div>
       <div>
         <h5>Sensor 1 - Humidity</h5>
-        <canvas id="chart-h1" height="150"></canvas>
+        <canvas id="chart-h1" height="100"></canvas>
       </div>
       <div>
         <h5>Sensor 2 - Temperature</h5>
-        <canvas id="chart-t2" height="150"></canvas>
+        <canvas id="chart-t2" height="100"></canvas>
       </div>
       <div>
         <h5>Sensor 2 - Humidity</h5>
-        <canvas id="chart-h2" height="150"></canvas>
+        <canvas id="chart-h2" height="100"></canvas>
       </div>
     </div>
   </div>
