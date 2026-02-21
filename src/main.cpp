@@ -7,13 +7,14 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 // FreeRTOS for early printing task
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-// Initialize the Adafruit IO WiFi client
-AdafruitIO_WiFi io(AIO_USERNAME, AIO_KEY, WIFI_SSID, WIFI_PASS);
-AdafruitIO_Feed *ledFeed = io.feed("led");
+// Initialize the Adafruit IO WiFi client pointer (constructed at runtime using stored creds)
+AdafruitIO_WiFi *io = nullptr;
+AdafruitIO_Feed *ledFeed = nullptr;
 
 // Ensure LED_BUILTIN is defined for this board
 #ifndef LED_BUILTIN
@@ -46,6 +47,44 @@ void earlyPrintTask(void *pvParameters);
 #define NUM_RGB 1
 Adafruit_NeoPixel strip(NUM_RGB, RGB_PIN, NEO_GRB + NEO_KHZ800);
 AdafruitIO_Feed *rgbFeed = nullptr;
+// Preferences (NVS) instance used across the file
+Preferences prefs;
+
+// Initialize Adafruit IO and feeds using stored or default credentials
+void initAdafruitIO() {
+  if (io != nullptr) return;
+  String stored_ssid = "";
+  String stored_pass = "";
+  prefs.begin("wifi", true);
+  stored_ssid = prefs.getString("ssid", "");
+  stored_pass = prefs.getString("pass", "");
+  prefs.end();
+
+  // Allow Adafruit IO credentials to be stored in NVS under namespace "aio".
+  String stored_aio_user = "";
+  String stored_aio_key = "";
+  prefs.begin("aio", true);
+  stored_aio_user = prefs.getString("user", "");
+  stored_aio_key = prefs.getString("key", "");
+  prefs.end();
+
+  const char* use_ssid = stored_ssid.length() ? stored_ssid.c_str() : WIFI_SSID;
+  const char* use_pass = stored_ssid.length() ? stored_pass.c_str() : WIFI_PASS;
+
+  const char* use_user = stored_aio_user.length() ? stored_aio_user.c_str() : AIO_USERNAME;
+  const char* use_key = stored_aio_key.length() ? stored_aio_key.c_str() : AIO_KEY;
+
+  io = new AdafruitIO_WiFi(use_user, use_key, use_ssid, use_pass);
+  // create feeds
+  ledFeed = io->feed("led");
+  relayFeeds[0] = io->feed("relay1");
+  relayFeeds[1] = io->feed("relay2");
+  relayFeeds[2] = io->feed("relay3");
+  relayFeeds[3] = io->feed("relay4");
+  relayFeeds[4] = io->feed("relay5");
+  relayFeeds[5] = io->feed("relay6");
+  rgbFeed = io->feed("rgb");
+}
 uint8_t current_r = 0, current_g = 0, current_b = 0;
 
 // DHT22 sensors (AM2302) on pins 15 and 16
@@ -134,10 +173,21 @@ String serialLine = "";
 int lastWiFiScanCount = 0;
 
 // Configuration portal state
-Preferences prefs;
 WebServer configServer(80);
+WebServer dashboardServer(80);
 bool configPortalActive = false;
 int configScanCount = 0;
+bool dashboardActive = false;
+
+// Simple circular buffer for recent samples
+const int SAMPLE_BUFFER_SIZE = 200;
+unsigned long sampleTimes[SAMPLE_BUFFER_SIZE];
+float sample_t1[SAMPLE_BUFFER_SIZE];
+float sample_h1[SAMPLE_BUFFER_SIZE];
+float sample_t2[SAMPLE_BUFFER_SIZE];
+float sample_h2[SAMPLE_BUFFER_SIZE];
+int sampleIndex = 0;
+int sampleCount = 0;
 
 // WiFi reconnect helpers
 const unsigned long WIFI_INIT_TIMEOUT = 20000; // ms to wait for a connect attempt
@@ -183,6 +233,8 @@ bool tryConnectWiFiOnce() {
 // Forward declarations
 void startConfigPortal();
 void stopConfigPortal();
+void startDashboardServer();
+void stopDashboardServer();
 
 // WiFi event handler: log events and attempt reconnects
 void onWiFiEvent(WiFiEvent_t event) {
@@ -190,9 +242,15 @@ void onWiFiEvent(WiFiEvent_t event) {
     Serial.print("Event: GOT IP -> "); Serial.println(WiFi.localIP());
     wifiRetryCount = 0;
     lastWiFiAttempt = millis();
+    // start dashboard server when we have network
+    if (!configPortalActive) startDashboardServer();
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     Serial.println("Event: WIFI STA Disconnected");
-    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
+    } else {
+      Serial.println("RSSI: unknown (not connected)");
+    }
     if (!configPortalActive) {
       if (wifiRetryCount < WIFI_MAX_RETRIES) {
         Serial.println("Event: attempting WiFi reconnect...");
@@ -204,6 +262,8 @@ void onWiFiEvent(WiFiEvent_t event) {
         startConfigPortal();
       }
     }
+    // stop dashboard when disconnected
+    stopDashboardServer();
   }
 }
 
@@ -257,6 +317,119 @@ void handlePortalSave() {
   } else {
     configServer.send(400, "text/plain", "Missing SSID");
   }
+}
+
+// Dashboard handlers and storage
+void appendSample(unsigned long t, float t1, float h1, float t2, float h2) {
+  sampleTimes[sampleIndex] = t;
+  sample_t1[sampleIndex] = t1;
+  sample_h1[sampleIndex] = h1;
+  sample_t2[sampleIndex] = t2;
+  sample_h2[sampleIndex] = h2;
+  sampleIndex = (sampleIndex + 1) % SAMPLE_BUFFER_SIZE;
+  if (sampleCount < SAMPLE_BUFFER_SIZE) sampleCount++;
+}
+
+String buildJSONSamples() {
+  String out = "[";
+  int start = (sampleCount == SAMPLE_BUFFER_SIZE) ? sampleIndex : 0;
+  for (int i = 0; i < sampleCount; ++i) {
+    int idx = (start + i) % SAMPLE_BUFFER_SIZE;
+    if (i) out += ",";
+    out += "{";
+    out += "\"t\":" + String(sampleTimes[idx]) + ",";
+    out += "\"t1\":" + String(sample_t1[idx], 2) + ",";
+    out += "\"h1\":" + String(sample_h1[idx], 2) + ",";
+    out += "\"t2\":" + String(sample_t2[idx], 2) + ",";
+    out += "\"h2\":" + String(sample_h2[idx], 2);
+    out += "}";
+  }
+  out += "]";
+  return out;
+}
+
+void handleDashboardPage() {
+  String html = "<html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<title>ESP32 Dashboard</title></head><body>";
+  html += "<h3>Sensor Dashboard</h3>";
+  html += "<div id=\"status\">Loading...</div>";
+  html += "<pre id=\"data\"></pre>";
+  html += "<script>function load(){fetch('/data').then(r=>r.json()).then(d=>{document.getElementById('data').innerText=JSON.stringify(d,null,2);});}setInterval(load,5000);load();</script>";
+  html += "</body></html>";
+  dashboardServer.send(200, "text/html", html);
+}
+
+void handleDataJSON() {
+  String j = buildJSONSamples();
+  dashboardServer.send(200, "application/json", j);
+}
+
+void saveSamplesToFS() {
+  File f = SPIFFS.open("/samples.jsonl", FILE_APPEND);
+  if (!f) return;
+  int start = (sampleCount == SAMPLE_BUFFER_SIZE) ? sampleIndex : 0;
+  for (int i = 0; i < sampleCount; ++i) {
+    int idx = (start + i) % SAMPLE_BUFFER_SIZE;
+    char line[128];
+    snprintf(line, sizeof(line), "{\"t\":%lu,\"t1\":%.2f,\"h1\":%.2f,\"t2\":%.2f,\"h2\":%.2f}\n",
+             sampleTimes[idx], sample_t1[idx], sample_h1[idx], sample_t2[idx], sample_h2[idx]);
+    f.print(line);
+  }
+  f.close();
+}
+
+void startDashboardServer() {
+  if (dashboardActive) return;
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    Serial.println("SPIFFS mounted");
+  }
+  // Protected endpoints: require token via header `X-Auth-Token` or query `?token=`
+  dashboardServer.on("/dashboard", HTTP_GET, [](){
+    prefs.begin("dash", true);
+    String tok = prefs.getString("token", "");
+    prefs.end();
+    String got = dashboardServer.hasHeader("X-Auth-Token") ? dashboardServer.header("X-Auth-Token") : dashboardServer.arg("token");
+    if (tok.length() > 0 && got != tok) {
+      dashboardServer.send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    handleDashboardPage();
+  });
+  dashboardServer.on("/data", HTTP_GET, [](){
+    prefs.begin("dash", true);
+    String tok = prefs.getString("token", "");
+    prefs.end();
+    String got = dashboardServer.hasHeader("X-Auth-Token") ? dashboardServer.header("X-Auth-Token") : dashboardServer.arg("token");
+    if (tok.length() > 0 && got != tok) {
+      dashboardServer.send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    handleDataJSON();
+  });
+  dashboardServer.on("/save", HTTP_POST, [](){
+    prefs.begin("dash", true);
+    String tok = prefs.getString("token", "");
+    prefs.end();
+    String got = dashboardServer.hasHeader("X-Auth-Token") ? dashboardServer.header("X-Auth-Token") : dashboardServer.arg("token");
+    if (tok.length() > 0 && got != tok) {
+      dashboardServer.send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    saveSamplesToFS();
+    dashboardServer.send(200, "text/plain", "saved");
+  });
+  dashboardServer.begin();
+  dashboardActive = true;
+  Serial.println("Dashboard server started at /dashboard");
+}
+
+void stopDashboardServer() {
+  if (!dashboardActive) return;
+  dashboardServer.stop();
+  dashboardActive = false;
+  Serial.println("Dashboard server stopped");
 }
 
 void startConfigPortal() {
@@ -432,7 +605,8 @@ void handleSerialCommand(const String &cmd) {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
       // reconnect Adafruit IO
-      io.connect();
+      if (!io) initAdafruitIO();
+      if (io) io->connect();
     } else {
       Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
       Serial.print("WiFi status="); Serial.println(WiFi.status());
@@ -462,7 +636,8 @@ void handleSerialCommand(const String &cmd) {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
-      io.connect();
+      if (!io) initAdafruitIO();
+      if (io) io->connect();
     } else {
       Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
       Serial.print("WiFi status="); Serial.println(WiFi.status());
@@ -474,6 +649,86 @@ void handleSerialCommand(const String &cmd) {
   if (s == "wportal") {
     startConfigPortal();
     Serial.println("Config portal started. Connect to WiFi 'ESP32-Setup' and open http://192.168.4.1/");
+    return;
+  }
+
+  // wifi show -> display stored WiFi SSID (password not printed)
+  if (s == "wifi show") {
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString("ssid", "(none)");
+    prefs.end();
+    Serial.print("Stored WiFi SSID: "); Serial.println(ssid);
+    return;
+  }
+
+  // wifi clear -> remove stored WiFi credentials from NVS
+  if (s == "wifi clear") {
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    Serial.println("Cleared stored WiFi credentials.");
+    return;
+  }
+
+  // aio set <user> <key>  -> store Adafruit IO credentials to NVS and reconnect
+  if (s.startsWith("aio set ")) {
+    String rest = s.substring(8);
+    int space = rest.indexOf(' ');
+    if (space < 1) {
+      Serial.println("Usage: aio set <username> <key>");
+      return;
+    }
+    String user = rest.substring(0, space);
+    String key = rest.substring(space + 1);
+    prefs.begin("aio", false);
+    prefs.putString("user", user);
+    prefs.putString("key", key);
+    prefs.end();
+    Serial.println("Saved AIO credentials to NVS. Reinitializing Adafruit IO...");
+    if (io) {
+      io->wifi_disconnect();
+      delete io;
+      io = nullptr;
+    }
+    initAdafruitIO();
+    if (io) io->connect();
+    return;
+  }
+
+  if (s == "aio show") {
+    prefs.begin("aio", true);
+    String user = prefs.getString("user", "(none)");
+    prefs.end();
+    Serial.print("AIO user: "); Serial.println(user);
+    return;
+  }
+
+  // dashboard token <token> -> save token for dashboard auth
+  if (s.startsWith("dashboard token ")) {
+    String tok = s.substring(strlen("dashboard token "));
+    tok.trim();
+    if (tok.length() == 0) {
+      Serial.println("Usage: dashboard token <token>|show|clear");
+      return;
+    }
+    prefs.begin("dash", false);
+    prefs.putString("token", tok);
+    prefs.end();
+    Serial.println("Saved dashboard token.");
+    return;
+  }
+  if (s == "dashboard token show") {
+    prefs.begin("dash", true);
+    String tok = prefs.getString("token", "(none)");
+    prefs.end();
+    Serial.print("Dashboard token: "); Serial.println(tok);
+    return;
+  }
+  if (s == "dashboard token clear") {
+    prefs.begin("dash", false);
+    prefs.remove("token");
+    prefs.end();
+    Serial.println("Dashboard token cleared.");
     return;
   }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
@@ -496,16 +751,21 @@ void setup() {
   Serial.print("Build: "); Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
   Serial.print("AIO user: "); Serial.println(AIO_USERNAME);
   Serial.println("Starting...\n");
-
   // Start frequent early prints while setup continues
   startEarlyBootPrints();
+
+  // Configure WiFi behavior before attempting connection
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("esp32-relay");
+  WiFi.setSleep(false);
+
+  // register WiFi event handler to follow disconnects/reconnects
+  WiFi.onEvent(onWiFiEvent);
 
   // Start the IO connection
   // Attempt explicit WiFi connection first with timeout and diagnostics
   // Attempt connection and, on failure, start the config portal
   bool connected = tryConnectWiFiOnce();
-  // register WiFi event handler to follow disconnects/reconnects
-  WiFi.onEvent(onWiFiEvent);
   if (!connected) {
     Serial.println();
     // Print human-readable status
@@ -543,8 +803,14 @@ void setup() {
     startConfigPortal();
   }
 
-  // Now connect to Adafruit IO (will use WiFi if available)
-  io.connect();
+  // Initialize and connect to Adafruit IO (will use WiFi if available)
+  initAdafruitIO();
+  if (io) io->connect();
+  // report Adafruit IO connection status
+  if (io) {
+    Serial.print("Adafruit IO status: ");
+    Serial.println(io->statusText());
+  }
 
   // Initialize DHT sensors
   dht1.begin();
@@ -552,15 +818,15 @@ void setup() {
   Serial.println("DHT sensors initialized");
 
   // Attach a message handler to the feed
-  ledFeed->onMessage(handleMessage);
+  if (ledFeed) ledFeed->onMessage(handleMessage);
 
-  // Create and attach relay feeds
-  relayFeeds[0] = io.feed("relay1"); relayFeeds[0]->onMessage(handleRelay1);
-  relayFeeds[1] = io.feed("relay2"); relayFeeds[1]->onMessage(handleRelay2);
-  relayFeeds[2] = io.feed("relay3"); relayFeeds[2]->onMessage(handleRelay3);
-  relayFeeds[3] = io.feed("relay4"); relayFeeds[3]->onMessage(handleRelay4);
-  relayFeeds[4] = io.feed("relay5"); relayFeeds[4]->onMessage(handleRelay5);
-  relayFeeds[5] = io.feed("relay6"); relayFeeds[5]->onMessage(handleRelay6);
+  // Attach handlers to existing relay feeds (created in initAdafruitIO)
+  if (relayFeeds[0]) relayFeeds[0]->onMessage(handleRelay1);
+  if (relayFeeds[1]) relayFeeds[1]->onMessage(handleRelay2);
+  if (relayFeeds[2]) relayFeeds[2]->onMessage(handleRelay3);
+  if (relayFeeds[3]) relayFeeds[3]->onMessage(handleRelay4);
+  if (relayFeeds[4]) relayFeeds[4]->onMessage(handleRelay5);
+  if (relayFeeds[5]) relayFeeds[5]->onMessage(handleRelay6);
 
   // Initialize relay pins and publish their initial states
   for (uint8_t i = 0; i < 6; i++) {
@@ -575,11 +841,15 @@ void setup() {
   strip.begin();
   strip.setPixelColor(0, strip.Color(0,0,0));
   strip.show();
-  // create rgb feed and attach handler
-  rgbFeed = io.feed("rgb");
-  rgbFeed->onMessage(handleRGB);
+  // attach handler to rgb feed
+  if (rgbFeed) rgbFeed->onMessage(handleRGB);
   // publish initial rgb
   publishRGB();
+
+  // If already connected to WiFi, start dashboard
+  if (WiFi.status() == WL_CONNECTED && !configPortalActive) {
+    startDashboardServer();
+  }
 
   // Signal the early-print task to stop and give it a short time to exit
   stopEarlyPrint = true;
@@ -606,7 +876,7 @@ void loop() {
   }
 
   // Required to maintain the connection to Adafruit IO
-  io.run();
+  if (io) io->run();
 
   // If config portal active, handle web clients
   if (configPortalActive) {
@@ -620,7 +890,8 @@ void loop() {
         Serial.println("WiFi disconnected, attempting reconnect...");
         bool ok = tryConnectWiFiOnce();
         if (ok) {
-          io.connect();
+          if (!io) initAdafruitIO();
+          if (io) io->connect();
         }
       } else {
         Serial.println("WiFi failed after retries; starting config portal.");
@@ -673,13 +944,13 @@ void loop() {
 
   // Example: publish a random value every 10s
   static unsigned long last = 0;
-  if (millis() - last > 10000) {
+    if (millis() - last > 10000) {
     last = millis();
     int value = random(0, 2);
     Serial.print("Publishing: ");
     Serial.println(value);
-    if (io.isConnected()) {
-      ledFeed->save(value);
+    if (io && WiFi.status() == WL_CONNECTED) {
+      if (ledFeed) ledFeed->save(value);
     } else {
       Serial.println("Publish skipped: Adafruit IO not connected");
     }
