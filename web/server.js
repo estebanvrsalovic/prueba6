@@ -16,6 +16,7 @@ const MQTT_TELEMETRY_TOPIC = process.env.MQTT_TELEMETRY_TOPIC || 'esp32s3/teleme
 const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'esp32s3/state/#';
 
 app.use(express.static('public'));
+app.use(express.json());
 
 // ensure data directory exists
 const DATA_DIR = path.join(__dirname, 'data');
@@ -116,6 +117,27 @@ client.on('message', (topic, message) => {
   } else {
     // other topics
     io.emit('mqtt', { topic, payload });
+  }
+});
+
+// Debug/test endpoint to publish a relay command via HTTP
+app.post('/api/command', (req, res) => {
+  try {
+    const relay = req.body.relay;
+    const value = String(req.body.value);
+    if (typeof relay === 'undefined' || typeof value === 'undefined') return res.status(400).json({ error: 'relay and value required' });
+    const topic = `esp32s3/command/relay${relay}`;
+    console.log('HTTP test publish', topic, value);
+    client.publish(topic, value, { qos: 0 }, (err) => {
+      if (err) {
+        console.error('HTTP publish error', err);
+        return res.status(500).json({ error: err.toString() });
+      }
+      return res.json({ ok: true, topic, value });
+    });
+  } catch (e) {
+    console.error('HTTP /api/command error', e);
+    res.status(500).json({ error: e.toString() });
   }
 });
 
