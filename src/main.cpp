@@ -8,6 +8,10 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#if defined(ESP32)
+#include <esp_log.h>
+#endif
+#include <PubSubClient.h>
 // FreeRTOS for early printing task
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -49,6 +53,54 @@ Adafruit_NeoPixel strip(NUM_RGB, RGB_PIN, NEO_GRB + NEO_KHZ800);
 AdafruitIO_Feed *rgbFeed = nullptr;
 // Preferences (NVS) instance used across the file
 Preferences prefs;
+
+// MQTT client (optional)
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+const char *MQTT_BROKER = "test.mosquitto.org";
+const uint16_t MQTT_PORT = 1883;
+
+// Publish topics
+const char *MQTT_TELEMETRY_TOPIC = "esp32s3/telemetry"; // JSON payload
+const char *MQTT_COMMAND_TOPIC = "esp32s3/command/#";  // relay commands: esp32s3/command/relay1 -> payload 0/1
+
+// Helper: handle incoming MQTT messages
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.print("MQTT in ["); Serial.print(t); Serial.print("] -> "); Serial.println(msg);
+  // handle relay commands like topic ends with relayN
+  if (t.startsWith("esp32s3/command/relay")) {
+    int idx = t.substring(String("esp32s3/command/relay").length()).toInt();
+    if (idx >= 1 && idx <= 6) {
+      int val = msg.toInt();
+      int pin = RELAY_PINS[idx-1];
+      digitalWrite(pin, val ? HIGH : LOW);
+      Serial.print("MQTT: set relay "); Serial.print(idx); Serial.print(" -> "); Serial.println(val);
+      // publish back state on same topic without the wildcard
+      char stateTopic[64];
+      snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", idx);
+      mqtt.publish(stateTopic, digitalRead(pin) ? "1" : "0");
+    }
+  }
+}
+
+bool ensureMqttConnected() {
+  if (mqtt.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  Serial.print("Connecting to MQTT broker "); Serial.print(MQTT_BROKER); Serial.print(":"); Serial.println(MQTT_PORT);
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  if (mqtt.connect("esp32s3-client")) {
+    Serial.println("MQTT connected");
+    // subscribe to command topics
+    mqtt.subscribe("esp32s3/command/#");
+    return true;
+  }
+  Serial.print("MQTT connect failed, state="); Serial.println(mqtt.state());
+  return false;
+}
 
 // Initialize Adafruit IO and feeds using stored or default credentials
 void initAdafruitIO() {
@@ -191,13 +243,14 @@ int sampleCount = 0;
 
 // WiFi reconnect helpers
 const unsigned long WIFI_INIT_TIMEOUT = 20000; // ms to wait for a connect attempt
-const unsigned long WIFI_RETRY_INTERVAL = 30000; // ms between automatic retries
-const int WIFI_MAX_RETRIES = 3;
+const unsigned long WIFI_RETRY_INTERVAL = 15000; // ms between automatic retries
+const int WIFI_MAX_RETRIES = 6;
 unsigned long lastWiFiAttempt = 0;
 int wifiRetryCount = 0;
 
 // Try to connect using stored creds (if present) or defaults. Returns true if connected.
 bool tryConnectWiFiOnce() {
+  // Read stored credentials (if any)
   String stored_ssid = "";
   String stored_pass = "";
   prefs.begin("wifi", true);
@@ -205,27 +258,48 @@ bool tryConnectWiFiOnce() {
   stored_pass = prefs.getString("pass", "");
   prefs.end();
 
-  if (stored_ssid.length() > 0) {
-    Serial.print("Connecting to WiFi '"); Serial.print(stored_ssid); Serial.println("' (stored creds)");
-    WiFi.begin(stored_ssid.c_str(), stored_pass.c_str());
-  } else {
-    Serial.print("Connecting to WiFi '"); Serial.print(WIFI_SSID); Serial.println("'");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-  }
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_INIT_TIMEOUT) {
-    Serial.print('.');
-    delay(500);
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
-    wifiRetryCount = 0;
+  auto attemptConnectTo = [&](const String &target_ssid, const String &target_pass) -> bool {
+    Serial.print("Scanning for '"); Serial.print(target_ssid); Serial.println("' before attempting connect...");
+    int n = WiFi.scanNetworks();
+    bool found = false;
+    for (int i = 0; i < n; ++i) {
+      if (WiFi.SSID(i) == target_ssid) { found = true; break; }
+    }
+    if (!found) {
+      Serial.print("SSID '"); Serial.print(target_ssid); Serial.println("' not found in scan. Skipping connect attempt.");
+      return false;
+    }
+    Serial.print("Connecting to WiFi '"); Serial.print(target_ssid); Serial.println("'");
+    WiFi.begin(target_ssid.c_str(), target_pass.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_INIT_TIMEOUT) {
+      Serial.print('.');
+      delay(500);
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WiFi connected, IP: "); Serial.println(WiFi.localIP());
+      wifiRetryCount = 0;
+      lastWiFiAttempt = millis();
+      return true;
+    }
+    Serial.print("WiFi connect failed, status="); Serial.println(WiFi.status());
     lastWiFiAttempt = millis();
-    return true;
+    return false;
+  };
+
+  // 1) Try default credentials first
+  String default_ssid = String(WIFI_SSID);
+  String default_pass = String(WIFI_PASS);
+  if (attemptConnectTo(default_ssid, default_pass)) return true;
+
+  // 2) If default failed and stored creds exist and differ, try stored creds
+  if (stored_ssid.length() > 0 && stored_ssid != default_ssid) {
+    Serial.println("Attempting stored WiFi credentials after default failed...");
+    if (attemptConnectTo(stored_ssid, stored_pass)) return true;
   }
-  Serial.print("WiFi connect failed, status="); Serial.println(WiFi.status());
-  lastWiFiAttempt = millis();
+
+  // nothing worked
   wifiRetryCount++;
   return false;
 }
@@ -755,6 +829,12 @@ void setup() {
   startEarlyBootPrints();
 
   // Configure WiFi behavior before attempting connection
+  // Enable WiFi debug output to get detailed connection logs on serial
+#if defined(ESP8266)
+  WiFi.setDebugOutput(true);
+#elif defined(ESP32)
+  esp_log_level_set("wifi", ESP_LOG_INFO);
+#endif
   WiFi.setAutoReconnect(true);
   WiFi.setHostname("esp32-relay");
   WiFi.setSleep(false);
@@ -878,6 +958,11 @@ void loop() {
   // Required to maintain the connection to Adafruit IO
   if (io) io->run();
 
+  // Maintain MQTT connection and loop
+  if (ensureMqttConnected()) {
+    mqtt.loop();
+  }
+
   // If config portal active, handle web clients
   if (configPortalActive) {
     configServer.handleClient();
@@ -954,6 +1039,12 @@ void loop() {
     } else {
       Serial.println("Publish skipped: Adafruit IO not connected");
     }
+    // Publish via MQTT as well (telemetry placeholder)
+    if (ensureMqttConnected()) {
+      char buf[128];
+      snprintf(buf, sizeof(buf), "{\"uptime\":%lu,\"rand\":%d}", millis()/1000, value);
+      mqtt.publish(MQTT_TELEMETRY_TOPIC, buf);
+    }
   }
 
   // Read DHT sensors and print status every DHT_INTERVAL
@@ -982,6 +1073,12 @@ void loop() {
       Serial.print("Sensor DHT2 (pin "); Serial.print(DHTPIN2); Serial.println(") read failed");
     } else {
       Serial.print("DHT2 ("); Serial.print(DHTPIN2); Serial.print(") - Temp: "); Serial.print(t2); Serial.print(" *C, Humidity: "); Serial.print(h2); Serial.println(" %");
+    }
+    // Publish DHT readings via MQTT
+    if (ensureMqttConnected()) {
+      char payload[128];
+      snprintf(payload, sizeof(payload), "{\"t1\":%.2f,\"h1\":%.2f,\"t2\":%.2f,\"h2\":%.2f}", t1, h1, t2, h2);
+      mqtt.publish(MQTT_TELEMETRY_TOPIC, payload);
     }
     Serial.println("-----------------------------");
   }

@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32-S3 Telemetry</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;margin:16px}
+    pre{background:#111;color:#9f9;padding:12px}
+    .box{border:1px solid #ddd;padding:12px;margin-bottom:12px}
+    .relay{display:inline-block;padding:6px 10px;margin:4px;border-radius:4px;background:#eee}
+    .on{background:#9f9}
+    .off{background:#f99}
+  </style>
+</head>
+<body>
+  <h2>ESP32-S3 Telemetry</h2>
+  <div style="margin-bottom:8px">Status: <strong id="conn-status">connecting...</strong></div>
+  <div class="box">
+    <h4>Last telemetry</h4>
+    <pre id="telemetry">(no data yet)</pre>
+  </div>
+  <div class="box">
+    <h4>Telemetry graphs</h4>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <h5>Sensor 1 - Temperature</h5>
+        <canvas id="chart-t1" height="150"></canvas>
+      </div>
+      <div>
+        <h5>Sensor 1 - Humidity</h5>
+        <canvas id="chart-h1" height="150"></canvas>
+      </div>
+      <div>
+        <h5>Sensor 2 - Temperature</h5>
+        <canvas id="chart-t2" height="150"></canvas>
+      </div>
+      <div>
+        <h5>Sensor 2 - Humidity</h5>
+        <canvas id="chart-h2" height="150"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="box">
+    <h4>Relay states</h4>
+    <div id="relays"></div>
+    <div style="margin-top:8px">
+      <!-- control buttons -->
+      <span>Controls:</span>
+      <div id="controls" style="margin-top:6px"></div>
+    </div>
+  </div>
+  <div class="box">
+    <h4>Raw MQTT messages</h4>
+    <pre id="raw">(no messages yet)</pre>
+  </div>
+  <script src="https://cdn.socket.io/4.7.1/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
