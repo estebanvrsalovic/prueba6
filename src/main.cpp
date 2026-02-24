@@ -452,6 +452,51 @@ void saveSamplesToFS() {
   f.close();
 }
 
+// Publish stored samples file (/samples.jsonl) over MQTT so the server
+// can persist them into SQLite. This is triggered via a serial command
+// (Spanish-friendly phrases supported).
+void publishSamplesFileOverMQTT() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS not available");
+    return;
+  }
+  if (!ensureMqttConnected()) {
+    Serial.println("MQTT not connected; cannot publish stored samples");
+    return;
+  }
+  const char *path = "/samples.jsonl";
+  if (!SPIFFS.exists(path)) {
+    Serial.println("No samples file found to publish");
+    return;
+  }
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("Failed to open samples file for reading");
+    return;
+  }
+  Serial.println("Publishing stored samples to MQTT...");
+  int published = 0;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    bool ok = mqtt.publish(MQTT_TELEMETRY_TOPIC, line.c_str());
+    if (ok) published++;
+    // small throttle to avoid flooding
+    delay(50);
+  }
+  f.close();
+  Serial.print("Published "); Serial.print(published); Serial.println(" samples");
+  // archive or remove the file so repeated calls don't duplicate
+  String archived = String(path) + ".sent";
+  if (!SPIFFS.rename(path, archived.c_str())) {
+    // rename may fail on some builds; fall back to delete
+    SPIFFS.remove(path);
+  } else {
+    Serial.print("Archived samples to: "); Serial.println(archived);
+  }
+}
+
 void startDashboardServer() {
   if (dashboardActive) return;
   if (!SPIFFS.begin(true)) {
@@ -744,6 +789,45 @@ void handleSerialCommand(const String &cmd) {
     return;
   }
 
+  // wifi set <ssid> <password>  -> save WiFi creds to NVS and attempt connect
+  if (s.startsWith("wifi set ") || s.startsWith("wifi guardar ")) {
+    String rest;
+    if (s.startsWith("wifi set ")) rest = s.substring(strlen("wifi set "));
+    else rest = s.substring(strlen("wifi guardar "));
+    rest.trim();
+    int space = rest.indexOf(' ');
+    if (space < 1) {
+      Serial.println("Usage: wifi set <ssid> <password>    (ssid without spaces)");
+      return;
+    }
+    String ssid = rest.substring(0, space);
+    String pass = rest.substring(space + 1);
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    Serial.print("Saved WiFi credentials for: "); Serial.println(ssid);
+    Serial.print("Attempting to connect to '"); Serial.print(ssid); Serial.println("'...");
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long start = millis();
+    const unsigned long JOIN_TIMEOUT = 20000; // 20s
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < JOIN_TIMEOUT) {
+      Serial.print('.');
+      delay(500);
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
+      // re-init Adafruit IO / MQTT
+      if (!io) initAdafruitIO();
+      if (io) io->connect();
+    } else {
+      Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
+      Serial.print("WiFi status="); Serial.println(WiFi.status());
+    }
+    return;
+  }
+
   // aio set <user> <key>  -> store Adafruit IO credentials to NVS and reconnect
   if (s.startsWith("aio set ")) {
     String rest = s.substring(8);
@@ -803,6 +887,21 @@ void handleSerialCommand(const String &cmd) {
     prefs.remove("token");
     prefs.end();
     Serial.println("Dashboard token cleared.");
+    return;
+  }
+  // savefs -> persist in-memory samples buffer to SPIFFS
+  if (s == "savefs") {
+    saveSamplesToFS();
+    Serial.println("Saved in-memory samples to /samples.jsonl");
+    return;
+  }
+
+  // Spanish-friendly persistence command: publish SPIFFS samples to MQTT
+  // so the server (which subscribes to MQTT_TELEMETRY_TOPIC) can store them
+  if ((s.indexOf("persista") >= 0 || s.indexOf("persist") >= 0 || s.indexOf("persistir") >= 0 || s.indexOf("guardar") >= 0) &&
+      (s.indexOf("sqlite") >= 0 || s.indexOf("sql") >= 0)) {
+    Serial.println("Serial: requested persist to SQLite -> publishing stored samples...");
+    publishSamplesFileOverMQTT();
     return;
   }
   Serial.print("Unknown serial command: "); Serial.println(cmd);
