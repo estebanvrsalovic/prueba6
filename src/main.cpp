@@ -13,6 +13,7 @@
 #endif
 #include <PubSubClient.h>
 #include <time.h>
+#include <HTTPClient.h>
 // FreeRTOS for early printing task
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -102,6 +103,60 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       mqtt.publish(stateTopic, digitalRead(pin) ? "1" : "0");
     }
   }
+}
+
+// Read device schedule URL from Preferences (key: "device_schedule_url" in namespace "cloud")
+String getDeviceScheduleUrlFromPrefs() {
+  prefs.begin("cloud", true);
+  String url = prefs.getString("device_schedule_url", "");
+  prefs.end();
+  return url;
+}
+
+// POST schedule CSV contents to configured HTTP endpoint (device_schedule)
+bool postScheduleToHttp(const String &contents) {
+  String url = getDeviceScheduleUrlFromPrefs();
+  if (url.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "text/plain");
+  int code = http.POST((uint8_t*)contents.c_str(), contents.length());
+  bool ok = (code >= 200 && code < 300);
+  if (!ok) {
+    Serial.print("HTTP POST schedule failed, code="); Serial.println(code);
+  } else {
+    Serial.println("HTTP POST schedule succeeded");
+  }
+  http.end();
+  return ok;
+}
+
+// GET schedule CSV from configured HTTP endpoint and write to /schedule.csv
+bool getScheduleFromHttpAndSave() {
+  String url = getDeviceScheduleUrlFromPrefs();
+  if (url.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.print("HTTP GET schedule failed, code="); Serial.println(code);
+    http.end();
+    return false;
+  }
+  String payload = http.getString();
+  http.end();
+  if (payload.length() == 0) return false;
+  if (!SPIFFS.begin(true)) { Serial.println("SPIFFS mount failed; cannot save schedule from HTTP"); return false; }
+  File f = SPIFFS.open("/schedule.csv", FILE_WRITE);
+  if (!f) { Serial.println("Failed to open /schedule.csv for writing (HTTP)"); return false; }
+  f.print(payload);
+  f.close();
+  Serial.println("Saved schedule.csv from HTTP endpoint");
+  // load into memory
+  loadScheduleFromFS();
+  return true;
 }
 
 bool ensureMqttConnected() {
@@ -242,6 +297,38 @@ void clearScheduleInMemory() {
   scheduleCount = 0;
 }
 
+// Compact schedule array to remove unused entries and keep them contiguous
+void compactSchedule() {
+  int dst = 0;
+  for (int src = 0; src < scheduleCount; ++src) {
+    if (!scheduleEvents[src].used) continue;
+    if (dst != src) scheduleEvents[dst] = scheduleEvents[src];
+    dst++;
+  }
+  // mark remaining slots unused
+  for (int i = dst; i < SCHEDULE_MAX_EVENTS; ++i) scheduleEvents[i].used = false;
+  scheduleCount = dst;
+}
+
+// Helper to add a schedule event safely (returns true if added)
+bool addScheduleEvent(unsigned long ts, unsigned long long epoch_ms, uint8_t relay, unsigned long duration, bool repeat8) {
+  if (relay < 1 || relay > 6) return false;
+  if (duration == 0) return false;
+  if (scheduleCount >= SCHEDULE_MAX_EVENTS) {
+    // try to compact and free space
+    compactSchedule();
+    if (scheduleCount >= SCHEDULE_MAX_EVENTS) return false;
+  }
+  scheduleEvents[scheduleCount].ts = ts;
+  scheduleEvents[scheduleCount].epoch_ms = epoch_ms;
+  scheduleEvents[scheduleCount].relay = relay;
+  scheduleEvents[scheduleCount].duration = duration;
+  scheduleEvents[scheduleCount].used = true;
+  scheduleEvents[scheduleCount].repeat8 = repeat8;
+  scheduleCount++;
+  return true;
+}
+
 // Load schedule from /schedule.csv (lines: ts,relay,duration)
 void loadScheduleFromFS() {
   if (!SPIFFS.begin(true)) { Serial.println("loadScheduleFromFS: SPIFFS mount failed"); return; }
@@ -253,47 +340,59 @@ void loadScheduleFromFS() {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
-    unsigned long long ets = 0; int relay = 0; unsigned long dur = 0;
-    // parse CSV
-    int c1 = line.indexOf(',');
-    int c2 = line.indexOf(',', c1+1);
-    if (c1 > 0 && c2 > c1) {
-      ets = (unsigned long long) strtoull(line.substring(0,c1).c_str(), NULL, 10);
-      relay = atoi(line.substring(c1+1, c2).c_str());
-      dur = (unsigned long) strtoul(line.substring(c2+1).c_str(), NULL, 10);
-      // Prepare ScheduleEvent entry. If ets looks like epoch-ms, store in epoch_ms
-      // and leave ts=0 until we can convert it to device-relative millis.
-      unsigned long targetMs = 0;
-      unsigned long long epochStore = 0ULL;
-      bool repeat = false;
-      // check for optional fourth field (repeat8)
-      if (c2 > 0) {
-        int c3 = line.indexOf(',', c2+1);
-        if (c3 > 0) {
-          // there is a 4th field; parse duration and repeat8 accordingly
-          dur = (unsigned long) strtoul(line.substring(c2+1, c3).c_str(), NULL, 10);
-          repeat = atoi(line.substring(c3+1).c_str()) ? true : false;
-        } else {
-          // no fourth field, parse duration normally
-          dur = (unsigned long) strtoul(line.substring(c2+1).c_str(), NULL, 10);
+    if (line.charAt(0) == '#') continue; // allow comments
+    // split into fields separated by commas; allow 3 or 4 fields
+    int fields[5];
+    fields[0] = 0;
+    int fieldIndex = 0;
+    int last = 0;
+    for (int i = 0; i <= line.length(); ++i) {
+      if (i == line.length() || line.charAt(i) == ',') {
+        if (fieldIndex < 4) {
+          fields[fieldIndex++] = last;
         }
-      }
-      if (ets > 1600000000000ULL) {
-        epochStore = ets;
-        targetMs = 0;
-      } else {
-        targetMs = (unsigned long)ets;
-      }
-      if (scheduleCount < SCHEDULE_MAX_EVENTS) {
-        scheduleEvents[scheduleCount].ts = targetMs;
-        scheduleEvents[scheduleCount].epoch_ms = epochStore;
-        scheduleEvents[scheduleCount].relay = relay;
-        scheduleEvents[scheduleCount].duration = dur;
-        scheduleEvents[scheduleCount].used = true;
-        scheduleEvents[scheduleCount].repeat8 = repeat;
-        scheduleCount++;
+        last = i + 1;
       }
     }
+    // now extract substrings safely
+    // fallback: use strtok-like parsing for simplicity
+    int numCommas = 0;
+    for (int i = 0; i < line.length(); ++i) if (line.charAt(i) == ',') numCommas++;
+    // expected 2 or 3 commas (3 or 4 fields)
+    int expectedFields = (numCommas >= 3) ? 4 : (numCommas >= 2 ? 3 : 0);
+    if (expectedFields < 3) continue;
+    // parse by using indexOf to get positions
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1 + 1);
+    int c3 = -1;
+    if (expectedFields == 4) c3 = line.indexOf(',', c2 + 1);
+    unsigned long long ets = 0ULL;
+    uint8_t relay = 0;
+    unsigned long dur = 0UL;
+    bool repeat = false;
+    // parse first field (ets)
+    ets = (unsigned long long) strtoull(line.substring(0, c1).c_str(), NULL, 10);
+    // parse relay
+    relay = (uint8_t) atoi(line.substring(c1 + 1, c2).c_str());
+    // parse duration and optional repeat
+    if (expectedFields == 3) {
+      dur = (unsigned long) strtoul(line.substring(c2 + 1).c_str(), NULL, 10);
+    } else {
+      dur = (unsigned long) strtoul(line.substring(c2 + 1, c3).c_str(), NULL, 10);
+      repeat = atoi(line.substring(c3 + 1).c_str()) ? true : false;
+    }
+    // validate parsed values
+    if (relay < 1 || relay > 6) continue;
+    if (dur == 0) continue;
+    unsigned long targetMs = 0UL;
+    unsigned long long epochStore = 0ULL;
+    if (ets > 1600000000000ULL) {
+      epochStore = ets;
+      targetMs = 0UL;
+    } else {
+      targetMs = (unsigned long) ets;
+    }
+    addScheduleEvent(targetMs, epochStore, relay, dur, repeat);
   }
   f.close();
   Serial.print("Loaded schedule events: "); Serial.println(scheduleCount);
@@ -311,6 +410,12 @@ void loadScheduleFromFS() {
         if (contents.length() > 0) {
           mqtt.publish("esp32s3/schedule/loaded", contents.c_str());
           Serial.println("Published schedule/loaded via MQTT");
+          // Also attempt to post to HTTP device_schedule endpoint if configured
+          if (getDeviceScheduleUrlFromPrefs().length() > 0) {
+            if (postScheduleToHttp(contents)) {
+              Serial.println("Posted schedule/loaded to HTTP endpoint (on load)");
+            }
+          }
         }
       }
     }
@@ -320,12 +425,15 @@ void loadScheduleFromFS() {
 // Save remaining schedule (non-executed) back to FS
 void saveScheduleToFS() {
   if (!SPIFFS.begin(true)) { Serial.println("saveScheduleToFS: SPIFFS mount failed"); return; }
+  // compact before saving so file doesn't contain holes
+  compactSchedule();
   File f = SPIFFS.open("/schedule.csv", FILE_WRITE);
   if (!f) { Serial.println("saveScheduleToFS: failed to open file"); return; }
   for (int i = 0; i < scheduleCount; ++i) {
     if (!scheduleEvents[i].used) continue;
     char line[128];
     if (scheduleEvents[i].epoch_ms > 0ULL) {
+      // write epoch-ms form
       snprintf(line, sizeof(line), "%llu,%u,%lu,%d\n", scheduleEvents[i].epoch_ms, (unsigned)scheduleEvents[i].relay, scheduleEvents[i].duration, scheduleEvents[i].repeat8 ? 1 : 0);
     } else {
       snprintf(line, sizeof(line), "%lu,%u,%lu,%d\n", scheduleEvents[i].ts, (unsigned)scheduleEvents[i].relay, scheduleEvents[i].duration, scheduleEvents[i].repeat8 ? 1 : 0);
@@ -346,6 +454,12 @@ void saveScheduleToFS() {
       if (contents.length() > 0) {
         mqtt.publish("esp32s3/schedule/loaded", contents.c_str());
         Serial.println("Published schedule/loaded after save");
+          // Also attempt to post to HTTP device_schedule endpoint if configured
+          if (getDeviceScheduleUrlFromPrefs().length() > 0) {
+            if (postScheduleToHttp(contents)) {
+              Serial.println("Posted schedule/loaded to HTTP endpoint (on save)");
+            }
+          }
       }
     }
   }
@@ -453,6 +567,15 @@ void onWiFiEvent(WiFiEvent_t event) {
     lastWiFiAttempt = millis();
     // start dashboard server when we have network
     if (!configPortalActive) startDashboardServer();
+    // Try to fetch remote schedule (if configured) and overwrite local schedule
+    if (getDeviceScheduleUrlFromPrefs().length() > 0) {
+      Serial.println("Attempting to GET schedule from configured HTTP endpoint");
+      if (getScheduleFromHttpAndSave()) {
+        Serial.println("Fetched and saved schedule from HTTP endpoint");
+      } else {
+        Serial.println("No remote schedule fetched or failed");
+      }
+    }
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     Serial.println("Event: WIFI STA Disconnected");
     if (WiFi.status() == WL_CONNECTED) {
@@ -543,6 +666,19 @@ void handlePortalRoot() {
   // provide manual SSID input as fallback (also useful for hidden networks)
   html += "<br>Or enter SSID manually:<br><input name=\"ssid_manual\" type=\"text\" placeholder=\"SSID\"><br>";
   html += "Password:<br><input name=\"pass\" type=\"password\"><br><br><input type=\"submit\" value=\"Save & Connect\"></form>";
+  // show currently saved device_schedule_url (if any)
+  prefs.begin("cloud", true);
+  String current_ds = prefs.getString("device_schedule_url", "");
+  prefs.end();
+  html += "<hr><h4>Cloud / Device schedule URL</h4>";
+  html += "<p>Optional: endpoint where the device will GET/POST its /schedule.csv (plain CSV).</p>";
+  if (current_ds.length() > 0) {
+    html += "<p>Current saved URL: <strong>" + escapeHTML(current_ds) + "</strong></p>";
+  } else {
+    html += "<p>No device schedule URL configured.</p>";
+  }
+  html += "<label>Device schedule URL (http:// or https://)</label><br>";
+  html += "<input name=\"device_sched_url\" type=\"text\" placeholder=\"https://myserver.example.com/api/device_schedule\" value=\"" + escapeHTML(current_ds) + "\"><br>";
   html += "<p><em>Nota:</em> Si usas un hotspot móvil, configura la zona Wi‑Fi en 2.4 GHz (no 5 GHz) y usa WPA2 Personal.</p>";
   html += "<p>Refrescar lista: <a href=\"/scan\">Scan networks</a> — también puedes usar el comando serial 'wscan'.</p>";
   html += "</body></html>";
@@ -572,6 +708,7 @@ void handlePortalSave() {
     }
     Serial.println();
     String resp;
+    String saveMsg = "";
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Portal: connected, IP="); Serial.println(WiFi.localIP());
       // store credentials persistently now that connection succeeded
@@ -586,12 +723,50 @@ void handlePortalSave() {
       resp = "<html><body><h3>Connected</h3><p>IP: " + WiFi.localIP().toString() + "</p></body></html>";
       // ensure MQTT connected if needed
       ensureMqttConnected();
+      // save optional device schedule URL and validate it
+      String saveMsg = "";
+      if (configServer.hasArg("device_sched_url")) {
+        String ds = configServer.arg("device_sched_url");
+        if (ds.length() > 0) {
+          // basic validation: must start with http:// or https://
+          if (!(ds.startsWith("http://") || ds.startsWith("https://"))) {
+            saveMsg = "<p style=\"color:orange\">Warning: URL should start with http:// or https://. Saved anyway.</p>";
+          }
+          // attempt a quick GET to validate reachability
+          bool reachable = false;
+          HTTPClient httptest;
+          httptest.begin(ds);
+          int code = httptest.GET();
+          httptest.end();
+          if (code >= 200 && code < 300) {
+            reachable = true;
+          }
+          prefs.begin("cloud", false);
+          prefs.putString("device_schedule_url", ds);
+          prefs.end();
+          Serial.print("Saved device_schedule_url: "); Serial.println(ds);
+          if (reachable) {
+            saveMsg += "<p style=\"color:green\">Device schedule URL reachable (HTTP " + String(code) + ").</p>";
+          } else {
+            saveMsg += "<p style=\"color:orange\">Could not reach URL (HTTP " + String(code) + "). The URL was saved but may not be valid.</p>";
+          }
+        } else {
+          // empty value -> clear saved
+          prefs.begin("cloud", false);
+          prefs.remove("device_schedule_url");
+          prefs.end();
+          Serial.println("Cleared device_schedule_url");
+          saveMsg = "<p style=\"color:blue\">Device schedule URL cleared.</p>";
+        }
+      }
       // stop portal now that we're connected and credentials are saved
       stopConfigPortal();
     } else {
       Serial.print("Portal: failed to connect, status="); Serial.println(WiFi.status());
       resp = "<html><body><h3>Connection failed</h3><p>Device could not connect to '" + ssid + "'. Please verify SSID/password and that the AP is 2.4 GHz and uses WPA2 Personal. Use serial 'wscan' to debug.</p></body></html>";
     }
+    // append saveMsg (if any) so user sees feedback about device_schedule_url
+    if (saveMsg.length() > 0) resp += saveMsg;
     configServer.send(WiFi.status() == WL_CONNECTED ? 200 : 500, "text/html", resp);
   } else {
     configServer.send(400, "text/plain", "Missing SSID");
@@ -1529,6 +1704,8 @@ void loop() {
       Serial.println("NTP time now available; will convert epoch-based schedules");
       // convert any stored epoch_ms entries to device-relative ts
       unsigned long long nowEpochMs = getCurrentEpochMs();
+      // define a reasonable maximum future window for conversion (30 days)
+      const unsigned long MAX_FUTURE_MS = 30UL * 24UL * 3600UL * 1000UL;
       for (int i = 0; i < scheduleCount; ++i) {
         if (!scheduleEvents[i].used) continue;
         if (scheduleEvents[i].epoch_ms > 0ULL && scheduleEvents[i].ts == 0) {
@@ -1536,10 +1713,18 @@ void loop() {
             Serial.print("Dropping past schedule epoch_ms: "); Serial.println(scheduleEvents[i].epoch_ms);
             scheduleEvents[i].used = false;
           } else {
-            unsigned long delta = (unsigned long)(scheduleEvents[i].epoch_ms - nowEpochMs);
-            scheduleEvents[i].ts = millis() + delta;
-            scheduleEvents[i].epoch_ms = 0ULL;
-            Serial.print("Converted epoch schedule to ts in ms: "); Serial.println(scheduleEvents[i].ts);
+            unsigned long long delta64 = scheduleEvents[i].epoch_ms - nowEpochMs;
+            if (delta64 > (unsigned long long)MAX_FUTURE_MS) {
+              Serial.print("Dropping schedule too far in future (ms): "); Serial.println((unsigned long long)delta64);
+              scheduleEvents[i].used = false;
+            } else {
+              unsigned long delta = (unsigned long) delta64;
+              unsigned long nowMsRel = millis();
+              // avoid overflow: if delta would overflow unsigned long, drop
+              scheduleEvents[i].ts = nowMsRel + delta;
+              scheduleEvents[i].epoch_ms = 0ULL;
+              Serial.print("Converted epoch schedule to ts in ms: "); Serial.println(scheduleEvents[i].ts);
+            }
           }
         }
       }
