@@ -5,6 +5,10 @@ const rawEl = document.getElementById('raw');
 const relaysEl = document.getElementById('relays');
 const connStatusEl = document.getElementById('conn-status');
 const controlsEl = document.getElementById('controls');
+const valT1 = document.getElementById('val-t1');
+const valH1 = document.getElementById('val-h1');
+const valT2 = document.getElementById('val-t2');
+const valH2 = document.getElementById('val-h2');
 
 const ctxT1 = document.getElementById('chart-t1').getContext('2d');
 const ctxH1 = document.getElementById('chart-h1').getContext('2d');
@@ -49,6 +53,11 @@ for (let i=1;i<=6;i++) {
 socket.on('telemetry', (data) => {
   lastTelemetry = data;
   telemetryEl.textContent = JSON.stringify(data, null, 2);
+  // update human-readable latest values
+  if (data && typeof data.t1 !== 'undefined') valT1.textContent = Number(data.t1).toFixed(2) + ' °C';
+  if (data && typeof data.h1 !== 'undefined') valH1.textContent = Number(data.h1).toFixed(2) + ' %';
+  if (data && typeof data.t2 !== 'undefined') valT2.textContent = Number(data.t2).toFixed(2) + ' °C';
+  if (data && typeof data.h2 !== 'undefined') valH2.textContent = Number(data.h2).toFixed(2) + ' %';
   rawEl.textContent = `telemetry: ${JSON.stringify(data)}` + '\n' + rawEl.textContent;
   // update charts for each sensor field if present
   const ts = new Date().toLocaleTimeString();
