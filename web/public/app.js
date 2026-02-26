@@ -18,6 +18,52 @@ const ctxH2 = document.getElementById('chart-h2').getContext('2d');
 let relayStates = {};
 const MAX_HISTORY = 100;
 
+// Try to enable Supabase Realtime if the server provides anon config at runtime
+async function initSupabaseRealtime() {
+  try {
+    const r = await fetch('/api/supabase-config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    if (!cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY) return;
+    // load UMD build of supabase-js dynamically
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/dist/umd/supabase.min.js';
+      s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+    });
+    if (!window.supabase || !window.supabase.createClient) return;
+    const { createClient } = window.supabase;
+    const supabase = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+    // initial load: latest 50
+    const { data: rows } = await supabase.from('telemetry').select('*').order('ts', { ascending: false }).limit(50);
+    if (Array.isArray(rows)) {
+      rows.reverse().forEach(it => {
+        const ts = new Date(it.ts).toLocaleTimeString();
+        if (it.t1 !== null) pushPoint(chartT1, ts, Number(it.t1));
+        if (it.h1 !== null) pushPoint(chartH1, ts, Number(it.h1));
+        if (it.t2 !== null) pushPoint(chartT2, ts, Number(it.t2));
+        if (it.h2 !== null) pushPoint(chartH2, ts, Number(it.h2));
+      });
+    }
+    // subscribe to new inserts
+    supabase.channel('realtime-telemetry')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'telemetry' }, payload => {
+        const row = payload.new;
+        const ts = new Date(row.ts).toLocaleTimeString();
+        if (row.t1 !== null) { pushPoint(chartT1, ts, Number(row.t1)); valT1.textContent = Number(row.t1).toFixed(2) + ' °C'; }
+        if (row.h1 !== null) { pushPoint(chartH1, ts, Number(row.h1)); valH1.textContent = Number(row.h1).toFixed(2) + ' %'; }
+        if (row.t2 !== null) { pushPoint(chartT2, ts, Number(row.t2)); valT2.textContent = Number(row.t2).toFixed(2) + ' °C'; }
+        if (row.h2 !== null) { pushPoint(chartH2, ts, Number(row.h2)); valH2.textContent = Number(row.h2).toFixed(2) + ' %'; }
+      })
+      .subscribe();
+  } catch (err) {
+    console.debug('Supabase realtime not available', err);
+  }
+}
+
+// attempt to initialize Supabase realtime; non-blocking
+initSupabaseRealtime();
+
 function makeChart(ctx, label, color) {
   return new Chart(ctx, {
     type: 'line',
