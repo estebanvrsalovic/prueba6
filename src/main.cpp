@@ -196,8 +196,8 @@ uint8_t current_r = 0, current_g = 0, current_b = 0;
 DHT dht1(DHTPIN1, DHTTYPE);
 DHT dht2(DHTPIN2, DHTTYPE);
 
-// DHT read interval (ms)
-const unsigned long DHT_INTERVAL = 15000;
+// DHT read interval (ms) — changed to 2 minutes
+const unsigned long DHT_INTERVAL = 120000; // 120000 ms = 2 minutes
 unsigned long lastDHT = 0;
 // Heartbeat interval (ms)
 const unsigned long HEARTBEAT_INTERVAL = 5000;

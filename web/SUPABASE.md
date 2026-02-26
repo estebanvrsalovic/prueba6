@@ -47,6 +47,9 @@ SUPABASE_FUNCTIONS_BASE=https://xyz.supabase.co/functions/v1 npm start
 
 This approach lets your frontend continue calling `/api/schedule` and device code continue using `/api/device_schedule` while storage and business logic move to Supabase.
 
+Device configuration note:
+- The ESP firmware supports configuring a device schedule URL via the WiFi config portal. When set, the device will `GET` the CSV at that URL on WiFi connect and `POST` its saved `/schedule.csv` after changes. The preference is stored under NVS namespace `cloud` key `device_schedule_url`.
+
 Notes and integration suggestions:
 
 - The `device_schedule` endpoint returns CSV; device can `GET` to download and `POST` to upload its `/schedule.csv` contents.
