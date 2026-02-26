@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  backend:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - MQTT_BROKER=${MQTT_BROKER:-mqtt://test.mosquitto.org:1883}
+      - FRONTEND_URL=${FRONTEND_URL:-}

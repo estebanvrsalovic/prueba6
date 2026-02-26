@@ -1,0 +1,28 @@
+[app]
+  # change this to your desired app name
+  name = "prueba6-backend"
+  # recommended region, change as needed
+  # region = "iad"
+
+[[services]]
+  internal_port = 3000
+  protocol = "tcp"
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.tcp_checks]]
+    interval = 10000
+    timeout = 2000
+    port = 3000
+    restart_limit = 0

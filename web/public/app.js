@@ -132,3 +132,174 @@ fetch('/history?n=100').then(r => r.json()).then(arr => {
     if (typeof it.h2 !== 'undefined' && it.h2 !== null) pushPoint(chartH2, ts, Number(it.h2));
   });
 }).catch(e=>{});
+
+// --- Plans UI (localStorage-backed) ---------------------------------------------------------
+const plansListEl = document.getElementById('plans-list');
+const btnNewPlan = document.getElementById('btn-new-plan');
+const planEditor = document.getElementById('plan-editor');
+const planSim = document.getElementById('plan-sim');
+const btnSavePlan = document.getElementById('btn-save-plan');
+const btnCancelPlan = document.getElementById('btn-cancel-plan');
+const planNameInput = document.getElementById('plan-name');
+const planTypeInput = document.getElementById('plan-type');
+const planActiveInput = document.getElementById('plan-active');
+const daysGrid = document.getElementById('days-grid');
+const simDaySelect = document.getElementById('sim-day');
+const simTimeline = document.getElementById('sim-timeline');
+
+let plans = []; // {id,name,type,active,days:[ {events: [ {id,h,m,duration,label} ] } x8 ]}
+let editingPlanId = null;
+
+function uid(prefix='p') { return prefix + '-' + Math.random().toString(36).slice(2,9); }
+
+function loadPlans() {
+  try { plans = JSON.parse(localStorage.getItem('plans_v1') || '[]'); } catch(e){ plans = []; }
+  renderPlansList();
+}
+
+function savePlans() { localStorage.setItem('plans_v1', JSON.stringify(plans)); }
+
+function renderPlansList() {
+  plansListEl.innerHTML = '';
+  if (plans.length === 0) {
+    plansListEl.innerHTML = '<em style="color:var(--muted)">No hay planes. Crea uno nuevo.</em>';
+    return;
+  }
+  const wrap = document.createElement('div'); wrap.className = 'plans-grid';
+  plans.forEach(p => {
+    const c = document.createElement('div'); c.className = 'plan-card';
+    const h = document.createElement('h5'); h.textContent = p.name || '(sin nombre)'; c.appendChild(h);
+    const meta = document.createElement('div'); meta.style.marginBottom='6px'; meta.innerHTML = `<strong>${p.type === 'riego' ? 'Riego 💧' : 'Iluminación 💡'}</strong> • ${p.active ? 'Activo' : 'Inactivo'}`;
+    c.appendChild(meta);
+    // visual 8-day summary
+    const strip = document.createElement('div'); strip.className='day-strip';
+    for (let i=0;i<8;i++){
+      const chip = document.createElement('div'); chip.className='day-chip';
+      const evcount = (p.days && p.days[i] && p.days[i].events) ? p.days[i].events.length : 0;
+      chip.textContent = evcount>0?evcount:'';
+      if (evcount>0) chip.classList.add('active');
+      strip.appendChild(chip);
+    }
+    c.appendChild(strip);
+    const actions = document.createElement('div'); actions.style.marginTop='8px';
+    const ebtn = document.createElement('button'); ebtn.className='btn ghost'; ebtn.textContent='Editar'; ebtn.onclick = ()=>{ openEditor(p.id); };
+    const dbtn = document.createElement('button'); dbtn.className='btn ghost'; dbtn.style.marginLeft='6px'; dbtn.textContent='Eliminar'; dbtn.onclick = ()=>{ if(confirm('Eliminar plan?')){ plans = plans.filter(x=>x.id!==p.id); savePlans(); renderPlansList(); } };
+    const sbtn = document.createElement('button'); sbtn.className='btn'; sbtn.style.marginLeft='6px'; sbtn.textContent='Simular'; sbtn.onclick = ()=>{ openSim(p.id); };
+    actions.appendChild(ebtn); actions.appendChild(dbtn); actions.appendChild(sbtn);
+    c.appendChild(actions);
+    wrap.appendChild(c);
+  });
+  plansListEl.appendChild(wrap);
+}
+
+function createEmptyPlan(){
+  const days = Array.from({length:8}).map(()=>({events:[]}));
+  return { id: uid('plan'), name:'Nuevo plan', type:'riego', active:true, days };
+}
+
+btnNewPlan.onclick = ()=>{ editingPlanId = null; showEditor(createEmptyPlan()); };
+
+function showEditor(plan){
+  planEditor.style.display='block'; planSim.style.display='none';
+  planNameInput.value = plan.name||''; planTypeInput.value = plan.type||'riego'; planActiveInput.checked = !!plan.active;
+  // build days grid
+  daysGrid.innerHTML='';
+  for(let d=0;d<8;d++){
+    const col = document.createElement('div'); col.className='day-column'; col.dataset.day=d;
+    const hdr = document.createElement('div'); hdr.style.marginBottom='6px'; hdr.innerHTML = `<strong>Día ${d}</strong> <button class="btn ghost" style="float:right" data-add>+ Evento</button>`;
+    col.appendChild(hdr);
+    const list = document.createElement('div'); list.className='events-list'; list.dataset.day=d;
+    const events = (plan.days && plan.days[d] && plan.days[d].events) ? plan.days[d].events.slice() : [];
+    events.forEach(ev=>{ appendEventElement(list, ev, plan); });
+    col.appendChild(list);
+    daysGrid.appendChild(col);
+  }
+  // wire add buttons
+  daysGrid.querySelectorAll('[data-add]').forEach(b=>{
+    b.onclick = (ev)=>{
+      const day = Number(ev.target.closest('.day-column').dataset.day);
+      const newEv = { id: uid('ev'), h:12, m:0, duration:60000, label:'' };
+      const list = ev.target.closest('.day-column').querySelector('.events-list');
+      appendEventElement(list, newEv, plan); list.scrollTop = list.scrollHeight; }
+  });
+  // store editing plan temporarily in DOM element
+  planEditor.dataset.plan = JSON.stringify(plan);
+}
+
+function appendEventElement(list, ev, plan){
+  const item = document.createElement('div'); item.className='event-item'; item.draggable=true; item.dataset.ev = JSON.stringify(ev);
+  const txt = document.createElement('div'); txt.innerHTML = `<div class="event-meta">${(ev.label||'')} ${pad(ev.h)}:${pad(ev.m)} • ${msToFriendly(ev.duration)}</div>`;
+  const controls = document.createElement('div');
+  const edit = document.createElement('button'); edit.className='btn ghost'; edit.textContent='✎'; edit.onclick = ()=>{ editEvent(item, ev, plan); };
+  const del = document.createElement('button'); del.className='btn ghost'; del.style.marginLeft='6px'; del.textContent='✖'; del.onclick = ()=>{ if(confirm('Eliminar evento?')) item.remove(); };
+  controls.appendChild(edit); controls.appendChild(del);
+  item.appendChild(txt); item.appendChild(controls);
+  // drag handlers
+  item.addEventListener('dragstart', (e)=>{ e.dataTransfer.setData('text/plain', JSON.stringify(ev)); item.style.opacity='0.5'; });
+  item.addEventListener('dragend', ()=>{ item.style.opacity='1'; });
+  list.appendChild(item);
+  // allow drops on list to reorder
+  list.addEventListener('dragover', (e)=>{ e.preventDefault(); });
+  list.addEventListener('drop', (e)=>{ e.preventDefault(); const data = e.dataTransfer.getData('text/plain'); try{ const dropped = JSON.parse(data); const newItem = document.createElement('div'); /* simple: append as new */ appendEventElement(list, dropped, plan); }catch(err){} });
+}
+
+function editEvent(item, ev, plan){
+  const h = prompt('Hora (HH:MM)', pad(ev.h)+':'+pad(ev.m)); if(!h) return; const parts = h.split(':'); ev.h = Number(parts[0]||0); ev.m = Number(parts[1]||0);
+  const dur = prompt('Duración en segundos', String(Math.floor(ev.duration/1000))); if(!dur) return; ev.duration = Number(dur)*1000;
+  const lbl = prompt('Etiqueta (opcional)', ev.label||''); ev.label = lbl||'';
+  // update display
+  item.querySelector('.event-meta').textContent = `${ev.label||''} ${pad(ev.h)}:${pad(ev.m)} • ${msToFriendly(ev.duration)}`;
+}
+
+function pad(n){ return (n<10? '0'+n : ''+n); }
+function msToFriendly(ms){ if(ms%3600000===0) return (ms/3600000)+' h'; if(ms%60000===0) return (ms/60000)+' min'; if(ms%1000===0) return (ms/1000)+' s'; return ms+' ms'; }
+
+btnCancelPlan.onclick = ()=>{ planEditor.style.display='none'; }
+
+btnSavePlan.onclick = ()=>{
+  const raw = planEditor.dataset.plan ? JSON.parse(planEditor.dataset.plan) : createEmptyPlan();
+  raw.name = planNameInput.value || raw.name;
+  raw.type = planTypeInput.value;
+  raw.active = planActiveInput.checked;
+  // gather events from DOM
+  raw.days = Array.from(daysGrid.querySelectorAll('.events-list')).map(list=>{
+    const evs = Array.from(list.children).map(ch=>JSON.parse(ch.dataset.ev));
+    return { events: evs };
+  });
+  if (!raw.id) raw.id = uid('plan');
+  // replace or push
+  const idx = plans.findIndex(x=>x.id===raw.id);
+  if (idx>=0) plans[idx]=raw; else plans.push(raw);
+  savePlans(); renderPlansList(); planEditor.style.display='none';
+}
+
+function openEditor(planId){
+  const p = plans.find(x=>x.id===planId); if(!p) return; editingPlanId = planId; showEditor(JSON.parse(JSON.stringify(p)));
+}
+
+function openSim(planId){
+  const p = plans.find(x=>x.id===planId); if(!p) return; planEditor.style.display='none'; planSim.style.display='block'; simDaySelect.innerHTML='';
+  for(let d=0;d<8;d++){ const o=document.createElement('option'); o.value=d; o.textContent='Día '+d; simDaySelect.appendChild(o); }
+  simDaySelect.onchange = ()=>{ renderSim(p, Number(simDaySelect.value)); };
+  renderSim(p, 0);
+}
+
+function renderSim(plan, day){
+  simTimeline.innerHTML='';
+  const events = (plan.days && plan.days[day] && plan.days[day].events) ? plan.days[day].events : [];
+  // draw 24h timeline width
+  const W = simTimeline.clientWidth || 800;
+  events.forEach(ev=>{
+    const start = (ev.h*3600 + ev.m*60) * 1000;
+    const left = (start / (24*3600*1000)) * 100;
+    const width = Math.max(1, (ev.duration / (24*3600*1000)) * 100);
+    const block = document.createElement('div'); block.className='sim-block '+(plan.type==='riego'?'mint':'amber');
+    block.style.left = left + '%'; block.style.width = width + '%'; block.title = `${pad(ev.h)}:${pad(ev.m)} • ${msToFriendly(ev.duration)}`;
+    block.textContent = `${pad(ev.h)}:${pad(ev.m)}`;
+    block.onmouseover = (e)=>{ const t = document.createElement('div'); t.style.position='absolute'; t.style.left=e.clientX+'px'; };
+    simTimeline.appendChild(block);
+  });
+}
+
+// initialize
+loadPlans();

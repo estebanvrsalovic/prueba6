@@ -5,16 +5,38 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>ESP32-S3 Telemetry</title>
   <style>
-    /* Light theme */
-    body{font-family:Arial,Helvetica,sans-serif;margin:16px;background:#ffffff;color:#111}
-    pre{background:#f7f7f7;color:#111;padding:12px;border:1px solid #e3e3e3;border-radius:4px}
-    .box{border:1px solid #e0e0e0;background:#ffffff;padding:12px;margin-bottom:12px;border-radius:6px;box-shadow:0 1px 2px rgba(0,0,0,0.03)}
-    .relay{display:inline-block;padding:6px 10px;margin:4px;border-radius:4px;background:#f1f1f1;color:#111}
-    .on{background:#d4f8d4}
-    .off{background:#ffd6d6}
-    /* Charts: smaller height and responsive container */
+    /* Dark industrial-organic theme */
+    :root{--bg:#0b0f0d;--panel:#0f1715;--muted:#98a098;--mint:#00ffcc;--amber:#ffb04d;--accent:#0fffbf}
+    body{font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;margin:16px;background:var(--bg);color:#dfeee6}
+    h2,h4{font-family: 'Georgia', 'Segoe UI', Arial, sans-serif}
+    pre{background:#07100f;color:#cfece1;padding:12px;border:1px solid #09201e;border-radius:6px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', monospace}
+    .box{border:1px solid #12221f;background:var(--panel);padding:14px;margin-bottom:14px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,0.6)}
+    .relay{display:inline-block;padding:6px 10px;margin:4px;border-radius:6px;background:#081210;color:#cfeee1;font-family:ui-monospace,monospace}
+    .on{background:rgba(0,255,204,0.12);border:1px solid rgba(0,255,204,0.18)}
+    .off{background:rgba(255,176,77,0.03);border:1px solid rgba(255,176,77,0.06)}
     .charts-grid canvas{height:100px !important;max-height:140px;width:100% !important}
-    @media (max-width:600px){ .charts-grid canvas{height:90px !important} }
+    @media (max-width:900px){ .charts-grid{grid-template-columns:1fr} }
+    /* Plans UI */
+    .plans-grid{display:flex;gap:12px;flex-wrap:wrap}
+    .plan-card{background:#07110f;padding:10px;border-radius:8px;border:1px solid #112523;min-width:220px}
+    .plan-card h5{margin:0 0 6px 0}
+    .day-strip{display:flex;gap:6px;align-items:center}
+    .day-chip{width:36px;height:36px;border-radius:6px;background:#081414;color:var(--muted);display:flex;align-items:center;justify-content:center;font-family:ui-monospace,monospace}
+    .day-chip.active{box-shadow:0 2px 6px rgba(0,0,0,0.6)}
+    .btn{background:#0b3a34;color:#e6fff6;border-radius:6px;padding:6px 10px;border:none;cursor:pointer}
+    .btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04)}
+    .grid-8{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-top:8px}
+    .day-column{background:#06120f;padding:8px;border-radius:6px;border:1px solid #0d2a28;min-height:120px}
+    .event-item{background:linear-gradient(90deg,rgba(0,255,204,0.06),rgba(255,176,77,0.03));padding:6px;margin-bottom:6px;border-radius:6px;display:flex;justify-content:space-between;align-items:center;cursor:grab;transition:transform .12s ease,opacity .12s}
+    .event-item:hover{transform:translateY(-2px)}
+    .event-meta{font-family:ui-monospace,monospace;color:var(--muted);font-size:13px}
+    .sim-timeline{position:relative;height:72px;background:#04110f;border-radius:6px;overflow:hidden;border:1px solid #07201d}
+    .sim-block{position:absolute;top:6px;height:60px;border-radius:4px;opacity:0.95;display:flex;align-items:center;justify-content:center;color:#04110f;font-family:ui-monospace,monospace;font-size:12px}
+    .sim-legend{display:flex;gap:8px;align-items:center;margin-top:6px}
+    .mint{background:linear-gradient(180deg,var(--mint),#00d9b2)}
+    .amber{background:linear-gradient(180deg,var(--amber),#f59f4a)}
+    .fade-in{animation:fadeIn .18s ease}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
   </style>
 </head>
 <body>
@@ -53,6 +75,38 @@
       <span>Controls:</span>
       <div id="controls" style="margin-top:6px"></div>
     </div>
+  </div>
+  <div class="box" id="plans-section">
+    <h4>Planes de riego e iluminación</h4>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div id="plans-list" style="flex:1"></div>
+      <div style="margin-left:12px">
+        <button id="btn-new-plan" class="btn">+ Crear plan</button>
+      </div>
+    </div>
+    <div id="plan-editor" style="margin-top:12px;display:none" class="fade-in">
+      <h5 id="editor-title">Editor de plan</h5>
+      <label>Nombre: <input id="plan-name" placeholder="Nombre del plan"></label>
+      <label style="margin-left:8px">Tipo:
+        <select id="plan-type">
+          <option value="riego">Riego 💧</option>
+          <option value="iluminacion">Iluminación 💡</option>
+        </select>
+      </label>
+      <label style="margin-left:8px"><input id="plan-active" type="checkbox" checked> Activo</label>
+      <div class="grid-8" id="days-grid" style="margin-top:10px"></div>
+      <div style="margin-top:8px">
+        <button id="btn-save-plan" class="btn">Guardar plan</button>
+        <button id="btn-cancel-plan" class="btn ghost" style="margin-left:8px">Cancelar</button>
+      </div>
+    </div>
+    <div id="plan-sim" style="margin-top:12px;display:none" class="fade-in">
+      <h5 id="sim-title">Vista de simulación</h5>
+      <label>Seleccionar día: <select id="sim-day"></select></label>
+      <div class="sim-timeline" id="sim-timeline" style="margin-top:8px"></div>
+      <div class="sim-legend"><div style="width:14px;height:14px;background:var(--mint);border-radius:3px"></div><div>Riego</div><div style="width:14px;height:14px;background:var(--amber);border-radius:3px;margin-left:8px"></div><div>Iluminación</div></div>
+    </div>
+    <small>Persistencia local: los planes se guardan en el navegador (localStorage).</small>
   </div>
   <div class="box">
     <h4>Raw MQTT messages</h4>

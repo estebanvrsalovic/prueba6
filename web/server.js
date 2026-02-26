@@ -8,12 +8,22 @@ const sqlite3 = require('sqlite3').verbose();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || '*',
+    methods: ['GET', 'POST']
+  }
+});
+// store last-known relay states so new web clients can be initialized
+const lastRelayStates = {};
 
 // Config via env
 const MQTT_BROKER = process.env.MQTT_BROKER || 'mqtt://test.mosquitto.org:1883';
 const MQTT_TELEMETRY_TOPIC = process.env.MQTT_TELEMETRY_TOPIC || 'esp32s3/telemetry';
 const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'esp32s3/state/#';
+// When set, forward frontend API calls to Supabase Edge Functions base URL
+// Example: https://xyz.supabase.co/functions/v1
+const SUPABASE_FUNCTIONS_BASE = process.env.SUPABASE_FUNCTIONS_BASE || '';
 
 app.use(express.static('public'));
 app.use(express.json());
@@ -29,11 +39,41 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS telemetry (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER,
+    device_ts INTEGER,
     t1 REAL,
     h1 REAL,
     t2 REAL,
     h2 REAL
   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_ts INTEGER,
+    relay INTEGER,
+    duration INTEGER,
+    repeat8 INTEGER DEFAULT 0,
+    created_ts INTEGER
+  )`);
+  // Ensure legacy DBs have the device_ts column
+  db.all(`PRAGMA table_info(telemetry)`, (err, rows) => {
+    if (err) {
+      console.error('PRAGMA table_info error', err);
+      return;
+    }
+    const hasDeviceTs = rows && rows.some(r => r.name === 'device_ts');
+    if (!hasDeviceTs) {
+      console.log('Altering telemetry table to add device_ts column');
+      db.run('ALTER TABLE telemetry ADD COLUMN device_ts INTEGER', (e) => { if (e) console.error('Failed to add device_ts column', e); });
+    }
+  });
+  // Ensure schedules table has repeat8 column for 8-day repeating schedules
+  db.all(`PRAGMA table_info(schedules)`, (err2, rows2) => {
+    if (err2) { console.error('PRAGMA table_info(schedules) error', err2); return; }
+    const hasRepeat8 = rows2 && rows2.some(r => r.name === 'repeat8');
+    if (!hasRepeat8) {
+      console.log('Altering schedules table to add repeat8 column');
+      db.run('ALTER TABLE schedules ADD COLUMN repeat8 INTEGER DEFAULT 0', (e) => { if (e) console.error('Failed to add repeat8 column', e); });
+    }
+  });
 });
 
 // HTTP endpoint to fetch last N telemetry records from DB
@@ -49,8 +89,145 @@ app.get('/history', (req, res) => {
   });
 });
 
+// Schedule endpoints: accept array of events {ts, relay, duration}
+app.post('/api/schedule', (req, res) => {
+  // If SUPABASE_FUNCTIONS_BASE is configured, proxy the request to Supabase Edge Function
+  if (SUPABASE_FUNCTIONS_BASE) {
+    (async () => {
+      try {
+        const target = `${SUPABASE_FUNCTIONS_BASE}/schedules`;
+        const fetchRes = await fetch(target, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req.body)
+        });
+        const text = await fetchRes.text();
+        // After persisting to Supabase, also publish to MQTT so devices get the update
+        try {
+          const events = req.body;
+          if (Array.isArray(events)) {
+            let payload = '';
+            events.forEach(ev => {
+              const ets = Number(ev.ts || ev.t || 0);
+              const relay = Number(ev.relay || 1);
+              const dur = Number(ev.duration || ev.d || 0);
+              const repeat8 = ev.repeat8 ? 1 : 0;
+              if (ets > 0) payload += `${ets},${relay},${dur},${repeat8}\n`;
+            });
+            if (payload.length > 0) {
+              client.publish('esp32s3/schedule', payload, { qos: 0 }, (err) => {
+                if (err) console.error('Failed to publish schedule payload:', err);
+                else console.log('Published schedule payload to esp32s3/schedule (proxied)');
+              });
+            }
+          }
+        } catch (e) { console.error('Post-proxy MQTT publish error', e); }
+        res.status(fetchRes.status).type(fetchRes.headers.get('content-type') || 'application/json').send(text);
+      } catch (err) {
+        console.error('Proxy to Supabase /schedules failed', err);
+        res.status(502).json({ error: 'Bad Gateway' });
+      }
+    })();
+    return;
+  }
+
+  try {
+    const events = req.body; // expect array
+    if (!Array.isArray(events)) return res.status(400).json({ error: 'expect array of events' });
+    // store into DB for persistence
+    const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
+    const now = Date.now();
+    events.forEach(ev => {
+      const ets = Number(ev.ts || ev.t || 0);
+      const relay = Number(ev.relay || 1);
+      const dur = Number(ev.duration || ev.d || 0);
+      const repeat8 = ev.repeat8 ? 1 : 0;
+      if (ets > 0) stmt.run(ets, relay, dur, repeat8, now);
+    });
+    stmt.finalize();
+    // publish schedule to MQTT as CSV lines: ts,relay,duration\n...
+    let payload = '';
+    events.forEach(ev => {
+      const ets = Number(ev.ts || ev.t || 0);
+      const relay = Number(ev.relay || 1);
+      const dur = Number(ev.duration || ev.d || 0);
+      const repeat8 = ev.repeat8 ? 1 : 0;
+      if (ets > 0) payload += `${ets},${relay},${dur},${repeat8}\n`;
+    });
+    if (payload.length > 0) {
+      console.log('Publishing schedule to esp32s3/schedule, payload length=', payload.length);
+      // Log a shortened preview to avoid huge logs
+      console.log('Schedule payload preview:', payload.split('\n').slice(0,5).join('\n'));
+      client.publish('esp32s3/schedule', payload, { qos: 0 }, (err) => {
+        if (err) {
+          console.error('Failed to publish schedule payload:', err);
+        } else {
+          console.log('Published schedule payload to esp32s3/schedule');
+        }
+      });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/schedule error', e);
+    return res.status(500).json({ error: e.toString() });
+  }
+});
+
+// Return upcoming scheduled events from DB
+app.get('/api/schedule', (req, res) => {
+  if (SUPABASE_FUNCTIONS_BASE) {
+    (async () => {
+      try {
+        const target = `${SUPABASE_FUNCTIONS_BASE}/schedules`;
+        const fetchRes = await fetch(target, { method: 'GET', headers: { Accept: 'application/json' } });
+        const json = await fetchRes.json();
+        return res.status(fetchRes.status).json(json);
+      } catch (err) {
+        console.error('Proxy GET /api/schedule to Supabase failed', err);
+        return res.status(502).json({ error: 'Bad Gateway' });
+      }
+    })();
+    return;
+  }
+  db.all('SELECT id,event_ts as ts,relay,duration,repeat8,created_ts FROM schedules ORDER BY event_ts ASC LIMIT ?', [100], (err, rows) => {
+    if (err) return res.status(500).json({ error: err.toString() });
+    res.json(rows);
+  });
+});
+
+// Device schedule CSV proxy endpoints (for the ESP device to GET/POST CSV)
+app.get('/api/device_schedule', async (req, res) => {
+  if (!SUPABASE_FUNCTIONS_BASE) return res.status(404).send('Not configured');
+  try {
+    const target = `${SUPABASE_FUNCTIONS_BASE}/device_schedule`;
+    const fetchRes = await fetch(target, { method: 'GET', headers: { Accept: 'text/csv' } });
+    const text = await fetchRes.text();
+    res.status(fetchRes.status).type('text/csv').send(text);
+  } catch (e) {
+    console.error('Proxy GET /api/device_schedule failed', e);
+    res.status(502).json({ error: 'Bad Gateway' });
+  }
+});
+
+app.post('/api/device_schedule', express.text({ type: '*/*' }), async (req, res) => {
+  if (!SUPABASE_FUNCTIONS_BASE) return res.status(404).send('Not configured');
+  try {
+    const target = `${SUPABASE_FUNCTIONS_BASE}/device_schedule`;
+    const fetchRes = await fetch(target, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: req.body });
+    const text = await fetchRes.text();
+    res.status(fetchRes.status).type(fetchRes.headers.get('content-type') || 'text/plain').send(text);
+  } catch (e) {
+    console.error('Proxy POST /api/device_schedule failed', e);
+    res.status(502).json({ error: 'Bad Gateway' });
+  }
+});
+
 io.on('connection', (socket) => {
   console.log('Web client connected');
+  // initialize UI with last-known relay states
+  Object.keys(lastRelayStates).forEach((relay) => {
+    socket.emit('relay-state', { relay, state: lastRelayStates[relay] });
+  });
   socket.on('disconnect', () => console.log('Web client disconnected'));
   // Accept command events from web client and publish to MQTT
   socket.on('command', (cmd) => {
@@ -87,6 +264,10 @@ client.on('connect', () => {
   client.subscribe(MQTT_STATE_TOPIC, { qos: 0 }, (err) => {
     if (err) console.error('Subscribe state error', err);
   });
+  // subscribe to device-published schedule loaded notifications
+  client.subscribe('esp32s3/schedule/loaded', { qos: 0 }, (err) => {
+    if (err) console.error('Subscribe schedule/loaded error', err);
+  });
 });
 
 client.on('message', (topic, message) => {
@@ -98,12 +279,13 @@ client.on('message', (topic, message) => {
     try { obj = JSON.parse(payload); } catch(e) { obj = payload; }
     // insert into sqlite DB with timestamp
     try {
-      const ts = Date.now();
+      const server_ts = Date.now();
+      const device_ts = (typeof obj === 'object' && typeof obj.t !== 'undefined') ? Number(obj.t) : null;
       const t1 = (typeof obj === 'object' && typeof obj.t1 !== 'undefined') ? Number(obj.t1) : null;
       const h1 = (typeof obj === 'object' && typeof obj.h1 !== 'undefined') ? Number(obj.h1) : null;
       const t2 = (typeof obj === 'object' && typeof obj.t2 !== 'undefined') ? Number(obj.t2) : null;
       const h2 = (typeof obj === 'object' && typeof obj.h2 !== 'undefined') ? Number(obj.h2) : null;
-      db.run('INSERT INTO telemetry (ts,t1,h1,t2,h2) VALUES (?,?,?,?,?)', [ts,t1,h1,t2,h2]);
+      db.run('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2) VALUES (?,?,?,?,?,?)', [server_ts, device_ts, t1,h1,t2,h2]);
     } catch (e) { console.error('Failed to insert telemetry', e); }
     io.emit('telemetry', obj);
   } else if (topic.startsWith('esp32s3/state/')) {
@@ -113,10 +295,41 @@ client.on('message', (topic, message) => {
     if (typeof relay === 'string' && relay.startsWith('relay')) {
       relay = relay.substring('relay'.length);
     }
+    // update in-memory last-known state and notify clients
+    lastRelayStates[String(relay)] = String(payload);
     io.emit('relay-state', { relay, state: payload });
   } else {
-    // other topics
-    io.emit('mqtt', { topic, payload });
+    // special-case: device published its loaded schedule file -> sync DB
+    if (topic === 'esp32s3/schedule/loaded') {
+      const csv = payload;
+      console.log('Received schedule/loaded from device, syncing DB');
+      // parse CSV lines: ts,relay,duration,repeat8? and replace schedules table
+      db.serialize(() => {
+        db.run('DELETE FROM schedules', (err) => {
+          if (err) console.error('Failed to clear schedules table', err);
+        });
+        const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
+        const now = Date.now();
+        const lines = csv.split(/\r?\n/);
+        lines.forEach((ln) => {
+          if (!ln || ln.trim().length === 0) return;
+          const parts = ln.split(',');
+          if (parts.length < 3) return;
+          const ets = Number(parts[0] || 0);
+          const relay = Number(parts[1] || 1);
+          const dur = Number(parts[2] || 0);
+          const repeat8 = parts.length >= 4 ? (Number(parts[3]) ? 1 : 0) : 0;
+          // store epoch ms if looks like large number (>1e12) else store as relative ts
+          stmt.run(ets, relay, dur, repeat8, now);
+        });
+        stmt.finalize();
+      });
+      // also emit mqtt event to web clients so UI can react if needed
+      io.emit('mqtt', { topic, payload });
+    } else {
+      // other topics
+      io.emit('mqtt', { topic, payload });
+    }
   }
 });
 

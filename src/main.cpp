@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "credentials.h"
-#include "AdafruitIO_WiFi.h"
-#include "AdafruitIO_Feed.h"
+#include <Adafruit_NeoPixel.h>
+#include <DHT.h>
 #include <Adafruit_NeoPixel.h>
 #include <DHT.h>
 #include <WiFi.h>
@@ -12,31 +12,24 @@
 #include <esp_log.h>
 #endif
 #include <PubSubClient.h>
+#include <time.h>
 // FreeRTOS for early printing task
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-// Initialize the Adafruit IO WiFi client pointer (constructed at runtime using stored creds)
-AdafruitIO_WiFi *io = nullptr;
-AdafruitIO_Feed *ledFeed = nullptr;
+// (Adafruit IO removed) MQTT is used for telemetry/commands
 
 // Ensure LED_BUILTIN is defined for this board
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 13
 #endif
 
-// Callback for incoming feed messages
-void handleMessage(AdafruitIO_Data *data) {
-  Serial.print("Received -> ");
-  Serial.println(data->toString());
-  int v = data->toInt();
-  digitalWrite(LED_BUILTIN, v ? HIGH : LOW);
-}
+// no Adafruit IO message handler
 
 // Relay pin mapping (board: ESP32-S3-Relay-6CH)
-// Avoid GPIO1/GPIO3 (UART0) which are used for serial TX/RX
-const uint8_t RELAY_PINS[6] = {4, 5, 41, 42, 45, 46};
-AdafruitIO_Feed *relayFeeds[6];
+// NOTE: GPIO1 is UART0 TX (serial) and using it may interfere with Serial output.
+const uint8_t RELAY_PINS[6] = {1, 2, 41, 42, 45, 46};
+// relayFeeds removed; we'll publish states via MQTT
 
 // Early boot printing task
 TaskHandle_t earlyPrintTaskHandle = NULL;
@@ -50,7 +43,7 @@ void earlyPrintTask(void *pvParameters);
 #define RGB_PIN 38
 #define NUM_RGB 1
 Adafruit_NeoPixel strip(NUM_RGB, RGB_PIN, NEO_GRB + NEO_KHZ800);
-AdafruitIO_Feed *rgbFeed = nullptr;
+// rgbFeed removed
 // Preferences (NVS) instance used across the file
 Preferences prefs;
 
@@ -65,11 +58,36 @@ const char *MQTT_TELEMETRY_TOPIC = "esp32s3/telemetry"; // JSON payload
 const char *MQTT_COMMAND_TOPIC = "esp32s3/command/#";  // relay commands: esp32s3/command/relay1 -> payload 0/1
 
 // Helper: handle incoming MQTT messages
+// forward declarations for schedule functions used by mqttCallback
+void loadScheduleFromFS();
+void saveScheduleToFS();
+void clearScheduleInMemory();
+void initPendingOffs();
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   Serial.print("MQTT in ["); Serial.print(t); Serial.print("] -> "); Serial.println(msg);
+  // Handle schedule payload published as CSV lines: ts,relay,duration\n...
+  if (t == String("esp32s3/schedule")) {
+    Serial.println("Received schedule payload; saving to /schedule.csv");
+    if (!SPIFFS.begin(true)) {
+      Serial.println("SPIFFS mount failed; cannot save schedule");
+      return;
+    }
+    File f = SPIFFS.open("/schedule.csv", FILE_WRITE);
+    if (!f) {
+      Serial.println("Failed to open /schedule.csv for writing");
+      return;
+    }
+    f.print(msg);
+    f.close();
+    Serial.println("Schedule saved to /schedule.csv");
+    // load into in-memory schedule
+    loadScheduleFromFS();
+    return;
+  }
   // handle relay commands like topic ends with relayN
   if (t.startsWith("esp32s3/command/relay")) {
     int idx = t.substring(String("esp32s3/command/relay").length()).toInt();
@@ -96,47 +114,24 @@ bool ensureMqttConnected() {
     Serial.println("MQTT connected");
     // subscribe to command topics
     mqtt.subscribe("esp32s3/command/#");
+    // subscribe to schedule topic so device receives schedule CSV payloads
+    mqtt.subscribe("esp32s3/schedule");
+    // publish current relay states so server and web UI are up-to-date
+    for (uint8_t r = 1; r <= 6; ++r) {
+      int pin = RELAY_PINS[r-1];
+      const char *state = digitalRead(pin) ? "1" : "0";
+      char stateTopic[64];
+      snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%u", r);
+      mqtt.publish(stateTopic, state);
+      Serial.print("MQTT: reported relay "); Serial.print(r); Serial.print(" -> "); Serial.println(state);
+    }
     return true;
   }
   Serial.print("MQTT connect failed, state="); Serial.println(mqtt.state());
   return false;
 }
 
-// Initialize Adafruit IO and feeds using stored or default credentials
-void initAdafruitIO() {
-  if (io != nullptr) return;
-  String stored_ssid = "";
-  String stored_pass = "";
-  prefs.begin("wifi", true);
-  stored_ssid = prefs.getString("ssid", "");
-  stored_pass = prefs.getString("pass", "");
-  prefs.end();
-
-  // Allow Adafruit IO credentials to be stored in NVS under namespace "aio".
-  String stored_aio_user = "";
-  String stored_aio_key = "";
-  prefs.begin("aio", true);
-  stored_aio_user = prefs.getString("user", "");
-  stored_aio_key = prefs.getString("key", "");
-  prefs.end();
-
-  const char* use_ssid = stored_ssid.length() ? stored_ssid.c_str() : WIFI_SSID;
-  const char* use_pass = stored_ssid.length() ? stored_pass.c_str() : WIFI_PASS;
-
-  const char* use_user = stored_aio_user.length() ? stored_aio_user.c_str() : AIO_USERNAME;
-  const char* use_key = stored_aio_key.length() ? stored_aio_key.c_str() : AIO_KEY;
-
-  io = new AdafruitIO_WiFi(use_user, use_key, use_ssid, use_pass);
-  // create feeds
-  ledFeed = io->feed("led");
-  relayFeeds[0] = io->feed("relay1");
-  relayFeeds[1] = io->feed("relay2");
-  relayFeeds[2] = io->feed("relay3");
-  relayFeeds[3] = io->feed("relay4");
-  relayFeeds[4] = io->feed("relay5");
-  relayFeeds[5] = io->feed("relay6");
-  rgbFeed = io->feed("rgb");
-}
+// Adafruit IO removed: feeds are no longer created here. Use MQTT topics instead.
 uint8_t current_r = 0, current_g = 0, current_b = 0;
 
 // DHT22 sensors (AM2302) on pins 15 and 16
@@ -174,7 +169,9 @@ void stopEarlyBootPrints() {
 void publishRGB() {
   char buf[8];
   sprintf(buf, "#%02X%02X%02X", current_r, current_g, current_b);
-  if (rgbFeed) rgbFeed->save(String(buf));
+  if (ensureMqttConnected()) {
+    mqtt.publish("esp32s3/rgb", buf);
+  }
 }
 
 // Parse color string: #RRGGBB or R,G,B
@@ -196,28 +193,7 @@ bool parseColorString(const String &s, uint8_t &r, uint8_t &g, uint8_t &b) {
   return false;
 }
 
-// Handler for rgb feed
-void handleRGB(AdafruitIO_Data *data) {
-  String s = data->toString();
-  uint8_t r, g, b;
-  if (parseColorString(s, r, g, b)) {
-    current_r = r; current_g = g; current_b = b;
-    strip.setPixelColor(0, strip.Color(r, g, b));
-    strip.show();
-    publishRGB();
-    Serial.print("RGB set to "); Serial.println(s);
-  } else {
-    Serial.print("Invalid rgb format: "); Serial.println(s);
-  }
-}
-
-// Individual handlers for each relay feed
-void handleRelay1(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[0], data->toInt() ? HIGH : LOW); relayFeeds[0]->save(digitalRead(RELAY_PINS[0])); Serial.println("relay1 updated"); }
-void handleRelay2(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[1], data->toInt() ? HIGH : LOW); relayFeeds[1]->save(digitalRead(RELAY_PINS[1])); Serial.println("relay2 updated"); }
-void handleRelay3(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[2], data->toInt() ? HIGH : LOW); relayFeeds[2]->save(digitalRead(RELAY_PINS[2])); Serial.println("relay3 updated"); }
-void handleRelay4(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[3], data->toInt() ? HIGH : LOW); relayFeeds[3]->save(digitalRead(RELAY_PINS[3])); Serial.println("relay4 updated"); }
-void handleRelay5(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[4], data->toInt() ? HIGH : LOW); relayFeeds[4]->save(digitalRead(RELAY_PINS[4])); Serial.println("relay5 updated"); }
-void handleRelay6(AdafruitIO_Data *data) { digitalWrite(RELAY_PINS[5], data->toInt() ? HIGH : LOW); relayFeeds[5]->save(digitalRead(RELAY_PINS[5])); Serial.println("relay6 updated"); }
+// Adafruit IO feed handlers removed; remote control is via MQTT topics
 
 // Serial command buffer and handler
 String serialLine = "";
@@ -240,6 +216,145 @@ float sample_t2[SAMPLE_BUFFER_SIZE];
 float sample_h2[SAMPLE_BUFFER_SIZE];
 int sampleIndex = 0;
 int sampleCount = 0;
+// Persist one sample every PERSIST_INTERVAL_MS to SPIFFS so server can retrieve it
+const unsigned long PERSIST_INTERVAL_MS = 30UL * 60UL * 1000UL; // 30 minutes
+unsigned long lastPersist = 0;
+bool spiffsMountedForPersist = false;
+
+// Schedule storage
+const int SCHEDULE_MAX_EVENTS = 128;
+struct ScheduleEvent { unsigned long ts; unsigned long long epoch_ms; uint8_t relay; unsigned long duration; bool used; bool repeat8; };
+ScheduleEvent scheduleEvents[SCHEDULE_MAX_EVENTS];
+int scheduleCount = 0;
+// whether we have NTP/epoch time available
+bool haveEpoch = false;
+
+// helper to get current epoch ms if available
+unsigned long long getCurrentEpochMs() {
+  time_t now = time(NULL);
+  if (now < 1600000000) return 0;
+  unsigned long long ms = (unsigned long long)now * 1000ULL + (unsigned long)(millis() % 1000);
+  return ms;
+}
+
+void clearScheduleInMemory() {
+  for (int i = 0; i < SCHEDULE_MAX_EVENTS; ++i) { scheduleEvents[i].used = false; }
+  scheduleCount = 0;
+}
+
+// Load schedule from /schedule.csv (lines: ts,relay,duration)
+void loadScheduleFromFS() {
+  if (!SPIFFS.begin(true)) { Serial.println("loadScheduleFromFS: SPIFFS mount failed"); return; }
+  if (!SPIFFS.exists("/schedule.csv")) { Serial.println("loadScheduleFromFS: no schedule file"); clearScheduleInMemory(); return; }
+  File f = SPIFFS.open("/schedule.csv", FILE_READ);
+  if (!f) { Serial.println("loadScheduleFromFS: failed to open file"); return; }
+  clearScheduleInMemory();
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    unsigned long long ets = 0; int relay = 0; unsigned long dur = 0;
+    // parse CSV
+    int c1 = line.indexOf(',');
+    int c2 = line.indexOf(',', c1+1);
+    if (c1 > 0 && c2 > c1) {
+      ets = (unsigned long long) strtoull(line.substring(0,c1).c_str(), NULL, 10);
+      relay = atoi(line.substring(c1+1, c2).c_str());
+      dur = (unsigned long) strtoul(line.substring(c2+1).c_str(), NULL, 10);
+      // Prepare ScheduleEvent entry. If ets looks like epoch-ms, store in epoch_ms
+      // and leave ts=0 until we can convert it to device-relative millis.
+      unsigned long targetMs = 0;
+      unsigned long long epochStore = 0ULL;
+      bool repeat = false;
+      // check for optional fourth field (repeat8)
+      if (c2 > 0) {
+        int c3 = line.indexOf(',', c2+1);
+        if (c3 > 0) {
+          // there is a 4th field; parse duration and repeat8 accordingly
+          dur = (unsigned long) strtoul(line.substring(c2+1, c3).c_str(), NULL, 10);
+          repeat = atoi(line.substring(c3+1).c_str()) ? true : false;
+        } else {
+          // no fourth field, parse duration normally
+          dur = (unsigned long) strtoul(line.substring(c2+1).c_str(), NULL, 10);
+        }
+      }
+      if (ets > 1600000000000ULL) {
+        epochStore = ets;
+        targetMs = 0;
+      } else {
+        targetMs = (unsigned long)ets;
+      }
+      if (scheduleCount < SCHEDULE_MAX_EVENTS) {
+        scheduleEvents[scheduleCount].ts = targetMs;
+        scheduleEvents[scheduleCount].epoch_ms = epochStore;
+        scheduleEvents[scheduleCount].relay = relay;
+        scheduleEvents[scheduleCount].duration = dur;
+        scheduleEvents[scheduleCount].used = true;
+        scheduleEvents[scheduleCount].repeat8 = repeat;
+        scheduleCount++;
+      }
+    }
+  }
+  f.close();
+  Serial.print("Loaded schedule events: "); Serial.println(scheduleCount);
+  // Publish the saved schedule file contents so external servers/UIs can sync
+  if (ensureMqttConnected()) {
+    if (SPIFFS.exists("/schedule.csv")) {
+      File rf = SPIFFS.open("/schedule.csv", FILE_READ);
+      if (rf) {
+        String contents = "";
+        while (rf.available()) {
+          contents += rf.readStringUntil('\n');
+          contents += '\n';
+        }
+        rf.close();
+        if (contents.length() > 0) {
+          mqtt.publish("esp32s3/schedule/loaded", contents.c_str());
+          Serial.println("Published schedule/loaded via MQTT");
+        }
+      }
+    }
+  }
+}
+
+// Save remaining schedule (non-executed) back to FS
+void saveScheduleToFS() {
+  if (!SPIFFS.begin(true)) { Serial.println("saveScheduleToFS: SPIFFS mount failed"); return; }
+  File f = SPIFFS.open("/schedule.csv", FILE_WRITE);
+  if (!f) { Serial.println("saveScheduleToFS: failed to open file"); return; }
+  for (int i = 0; i < scheduleCount; ++i) {
+    if (!scheduleEvents[i].used) continue;
+    char line[128];
+    if (scheduleEvents[i].epoch_ms > 0ULL) {
+      snprintf(line, sizeof(line), "%llu,%u,%lu,%d\n", scheduleEvents[i].epoch_ms, (unsigned)scheduleEvents[i].relay, scheduleEvents[i].duration, scheduleEvents[i].repeat8 ? 1 : 0);
+    } else {
+      snprintf(line, sizeof(line), "%lu,%u,%lu,%d\n", scheduleEvents[i].ts, (unsigned)scheduleEvents[i].relay, scheduleEvents[i].duration, scheduleEvents[i].repeat8 ? 1 : 0);
+    }
+    f.print(line);
+  }
+  f.close();
+  // After saving, publish the file contents so external servers/UIs can sync
+  if (ensureMqttConnected()) {
+    File rf = SPIFFS.open("/schedule.csv", FILE_READ);
+    if (rf) {
+      String contents = "";
+      while (rf.available()) {
+        contents += rf.readStringUntil('\n');
+        contents += '\n';
+      }
+      rf.close();
+      if (contents.length() > 0) {
+        mqtt.publish("esp32s3/schedule/loaded", contents.c_str());
+        Serial.println("Published schedule/loaded after save");
+      }
+    }
+  }
+}
+
+// Pending offs
+struct PendingOff { uint8_t relay; unsigned long end_ts; bool active; };
+PendingOff pendingOffs[6];
+void initPendingOffs() { for (int i=0;i<6;i++) pendingOffs[i].active=false; }
 
 // WiFi reconnect helpers
 const unsigned long WIFI_INIT_TIMEOUT = 20000; // ms to wait for a connect attempt
@@ -247,6 +362,14 @@ const unsigned long WIFI_RETRY_INTERVAL = 15000; // ms between automatic retries
 const int WIFI_MAX_RETRIES = 6;
 unsigned long lastWiFiAttempt = 0;
 int wifiRetryCount = 0;
+// Fallback retry behavior: after hitting WIFI_MAX_RETRIES we will continue
+// attempting full connect cycles every WIFI_FALLBACK_INTERVAL until a
+// total timeout WIFI_TOTAL_RETRY_TIMEOUT elapses, then we start the portal.
+const unsigned long WIFI_FALLBACK_INTERVAL = 120000; // 2 minutes
+const unsigned long WIFI_TOTAL_RETRY_TIMEOUT = 15UL * 60UL * 1000UL; // 15 minutes
+unsigned long wifiFailureStart = 0;
+bool wifiInFallback = false;
+unsigned long lastWiFailureCheck = 0;
 
 // Try to connect using stored creds (if present) or defaults. Returns true if connected.
 bool tryConnectWiFiOnce() {
@@ -259,6 +382,14 @@ bool tryConnectWiFiOnce() {
   prefs.end();
 
   auto attemptConnectTo = [&](const String &target_ssid, const String &target_pass) -> bool {
+    // Enforce WPA2 Personal passphrase rules: empty = open network, otherwise min 8 chars
+    if (target_pass.length() > 0) {
+      if (!(target_pass.length() >= 8 || target_pass.length() == 64)) {
+        Serial.print("Skipping connect to '"); Serial.print(target_ssid);
+        Serial.println("': password too short for WPA2 Personal (min 8 chars).");
+        return false;
+      }
+    }
     Serial.print("Scanning for '"); Serial.print(target_ssid); Serial.println("' before attempting connect...");
     int n = WiFi.scanNetworks();
     bool found = false;
@@ -266,8 +397,9 @@ bool tryConnectWiFiOnce() {
       if (WiFi.SSID(i) == target_ssid) { found = true; break; }
     }
     if (!found) {
-      Serial.print("SSID '"); Serial.print(target_ssid); Serial.println("' not found in scan. Skipping connect attempt.");
-      return false;
+      Serial.print("SSID '"); Serial.print(target_ssid);
+      Serial.println("' not found in scan. Proceeding to attempt connection anyway (hotspot may be 5GHz or hidden). If problems persist, ensure hotspot is 2.4 GHz and WPA2 Personal.");
+      // do not return; attempt connection anyway to support mobile hotspots and hidden SSIDs
     }
     Serial.print("Connecting to WiFi '"); Serial.print(target_ssid); Serial.println("'");
     WiFi.begin(target_ssid.c_str(), target_pass.c_str());
@@ -288,15 +420,18 @@ bool tryConnectWiFiOnce() {
     return false;
   };
 
-  // 1) Try default credentials first
+  // Prefer stored credentials first (helps when defaults are placeholders)
   String default_ssid = String(WIFI_SSID);
   String default_pass = String(WIFI_PASS);
-  if (attemptConnectTo(default_ssid, default_pass)) return true;
-
-  // 2) If default failed and stored creds exist and differ, try stored creds
-  if (stored_ssid.length() > 0 && stored_ssid != default_ssid) {
-    Serial.println("Attempting stored WiFi credentials after default failed...");
+  if (stored_ssid.length() > 0) {
+    Serial.print("Attempting stored WiFi credentials: '"); Serial.print(stored_ssid); Serial.println("'...");
     if (attemptConnectTo(stored_ssid, stored_pass)) return true;
+  }
+
+  // Fall back to compiled defaults if stored credentials are missing or failed
+  if (default_ssid.length() > 0) {
+    Serial.print("Attempting default WiFi credentials: '"); Serial.print(default_ssid); Serial.println("'...");
+    if (attemptConnectTo(default_ssid, default_pass)) return true;
   }
 
   // nothing worked
@@ -332,8 +467,12 @@ void onWiFiEvent(WiFiEvent_t event) {
         lastWiFiAttempt = millis();
         WiFi.reconnect();
       } else {
-        Serial.println("Event: max WiFi retries reached, starting config portal");
-        startConfigPortal();
+        // Enter fallback mode: continue trying full connect cycles periodically
+        if (!wifiInFallback) {
+          wifiInFallback = true;
+          wifiFailureStart = millis();
+          Serial.println("Event: entering fallback reconnect mode (periodic attempts)");
+        }
       }
     }
     // stop dashboard when disconnected
@@ -359,35 +498,101 @@ String escapeHTML(const String &s) {
   return out;
 }
 
+// Format uptime given seconds into human-readable string
+String formatUptime(unsigned long seconds) {
+  unsigned long days = seconds / 86400UL;
+  seconds %= 86400UL;
+  unsigned long hours = seconds / 3600UL;
+  seconds %= 3600UL;
+  unsigned long minutes = seconds / 60UL;
+  unsigned long secs = seconds % 60UL;
+  char buf[64];
+  if (days > 0) {
+    // Example: "1d 02:03:04"
+    snprintf(buf, sizeof(buf), "%lud %02luh %02lum %02lus", days, hours, minutes, secs);
+  } else if (hours > 0) {
+    // Example: "02:03:04"
+    snprintf(buf, sizeof(buf), "%02luh %02lum %02lus", hours, minutes, secs);
+  } else if (minutes > 0) {
+    // Example: "03m 04s"
+    snprintf(buf, sizeof(buf), "%02lum %02lus", minutes, secs);
+  } else {
+    snprintf(buf, sizeof(buf), "%luls", secs);
+  }
+  return String(buf);
+}
+
 void handlePortalRoot() {
+  // perform a fresh scan when serving the portal so results are up-to-date
+  configScanCount = WiFi.scanNetworks();
   String html = "<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head><body>";
   html += "<h3>ESP32 WiFi Setup</h3>";
-  html += "<form method=\"POST\" action=\"/save\">SSID:<br><select name=\"ssid\">";
-  for (int i = 0; i < configScanCount; ++i) {
-    String ssid = WiFi.SSID(i);
-    String esc = escapeHTML(ssid);
-    html += "<option value=\"" + esc + "\">" + esc + " (" + String(WiFi.RSSI(i)) + ")" + "</option>";
+  html += "<form method=\"POST\" action=\"/save\">";
+  html += "SSID:<br>";
+  if (configScanCount > 0) {
+    html += "<select name=\"ssid\">";
+    for (int i = 0; i < configScanCount; ++i) {
+      String ssid = WiFi.SSID(i);
+      String esc = escapeHTML(ssid);
+      html += "<option value=\"" + esc + "\">" + esc + " (" + String(WiFi.RSSI(i)) + ")" + "</option>";
+    }
+    html += "</select><br>";
+  } else {
+    html += "<em>No se encontraron redes. Ingresa el SSID manualmente abajo.</em><br>";
   }
-  html += "</select><br>Password:<br><input name=\"pass\" type=\"password\"><br><br><input type=\"submit\" value=\"Save & Connect\"></form>";
-  html += "<p>Use serial command 'wscan' to refresh network list from serial.</p>";
+  // provide manual SSID input as fallback (also useful for hidden networks)
+  html += "<br>Or enter SSID manually:<br><input name=\"ssid_manual\" type=\"text\" placeholder=\"SSID\"><br>";
+  html += "Password:<br><input name=\"pass\" type=\"password\"><br><br><input type=\"submit\" value=\"Save & Connect\"></form>";
+  html += "<p><em>Nota:</em> Si usas un hotspot móvil, configura la zona Wi‑Fi en 2.4 GHz (no 5 GHz) y usa WPA2 Personal.</p>";
+  html += "<p>Refrescar lista: <a href=\"/scan\">Scan networks</a> — también puedes usar el comando serial 'wscan'.</p>";
   html += "</body></html>";
   configServer.send(200, "text/html", html);
 }
 
 void handlePortalSave() {
-  if (configServer.hasArg("ssid")) {
+  if (configServer.hasArg("ssid") || configServer.hasArg("ssid_manual")) {
     String ssid = configServer.arg("ssid");
+    // prefer manual SSID if provided
+    if (ssid.length() == 0 && configServer.hasArg("ssid_manual")) ssid = configServer.arg("ssid_manual");
     String pass = configServer.arg("pass");
-    prefs.begin("wifi", false);
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass);
-    prefs.end();
-    String resp = "<html><body><h3>Saved credentials. Attempting to connect...</h3><p>The device will try to connect to: " + ssid + "</p></body></html>";
-    configServer.send(200, "text/html", resp);
-    // attempt connect (non-blocking: stop portal and let loop attempt)
-    stopConfigPortal();
+    // Require WPA2 Personal passphrase when a password is provided
+    if (pass.length() > 0 && !(pass.length() >= 8 || pass.length() == 64)) {
+      String resp = "<html><body><h3>Password must be a WPA2 passphrase (min 8 chars)</h3><p>Please retry.</p></body></html>";
+      configServer.send(400, "text/html", resp);
+      return;
+    }
+    Serial.print("Portal: attempting to connect to SSID='"); Serial.print(ssid); Serial.print("' pass_len="); Serial.println(pass.length());
+    // attempt connect immediately and report result to the user
     WiFi.begin(ssid.c_str(), pass.c_str());
-    delay(100);
+    unsigned long start = millis();
+    const unsigned long JOIN_TIMEOUT = 20000; // 20s
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < JOIN_TIMEOUT) {
+      Serial.print('.');
+      delay(500);
+    }
+    Serial.println();
+    String resp;
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Portal: connected, IP="); Serial.println(WiFi.localIP());
+      // store credentials persistently now that connection succeeded
+      prefs.begin("wifi", false);
+      prefs.putString("ssid", ssid);
+      prefs.putString("pass", pass);
+      // verify readback immediately
+      String verify_ssid = prefs.getString("ssid", "");
+      String verify_pass = prefs.getString("pass", "");
+      prefs.end();
+      Serial.print("Portal: persisted ssid='"); Serial.print(verify_ssid); Serial.print("' pass_len="); Serial.println(verify_pass.length());
+      resp = "<html><body><h3>Connected</h3><p>IP: " + WiFi.localIP().toString() + "</p></body></html>";
+      // ensure MQTT connected if needed
+      ensureMqttConnected();
+      // stop portal now that we're connected and credentials are saved
+      stopConfigPortal();
+    } else {
+      Serial.print("Portal: failed to connect, status="); Serial.println(WiFi.status());
+      resp = "<html><body><h3>Connection failed</h3><p>Device could not connect to '" + ssid + "'. Please verify SSID/password and that the AP is 2.4 GHz and uses WPA2 Personal. Use serial 'wscan' to debug.</p></body></html>";
+    }
+    configServer.send(WiFi.status() == WL_CONNECTED ? 200 : 500, "text/html", resp);
   } else {
     configServer.send(400, "text/plain", "Missing SSID");
   }
@@ -450,6 +655,29 @@ void saveSamplesToFS() {
     f.print(line);
   }
   f.close();
+}
+
+// Persist a single sample to SPIFFS (JSONL line). Safe to call occasionally.
+void persistSingleSampleToFS(unsigned long t, float t1, float h1, float t2, float h2) {
+  if (!spiffsMountedForPersist) {
+    if (!SPIFFS.begin(true)) {
+      Serial.println("persistSingleSampleToFS: SPIFFS mount failed");
+      return;
+    }
+    spiffsMountedForPersist = true;
+  }
+  File f = SPIFFS.open("/samples.jsonl", FILE_APPEND);
+  if (!f) {
+    Serial.println("persistSingleSampleToFS: failed to open /samples.jsonl");
+    return;
+  }
+  char line[256];
+  // timestamp is milliseconds since epoch on server side; here we store device millis (t)
+  snprintf(line, sizeof(line), "{\"t\":%lu,\"t1\":%.2f,\"h1\":%.2f,\"t2\":%.2f,\"h2\":%.2f}\n",
+           t, t1, h1, t2, h2);
+  f.print(line);
+  f.close();
+  Serial.print("Persisted single sample to SPIFFS: "); Serial.println(line);
 }
 
 // Publish stored samples file (/samples.jsonl) over MQTT so the server
@@ -539,6 +767,30 @@ void startDashboardServer() {
     saveSamplesToFS();
     dashboardServer.send(200, "text/plain", "saved");
   });
+  // Persist a single live sample to SPIFFS via HTTP POST (protected)
+  dashboardServer.on("/persist_sample", HTTP_POST, [](){
+    prefs.begin("dash", true);
+    String tok = prefs.getString("token", "");
+    prefs.end();
+    String got = dashboardServer.hasHeader("X-Auth-Token") ? dashboardServer.header("X-Auth-Token") : dashboardServer.arg("token");
+    if (tok.length() > 0 && got != tok) {
+      dashboardServer.send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    // Read sensors now and persist one sample
+    float h1 = dht1.readHumidity();
+    float t1 = dht1.readTemperature();
+    float h2 = dht2.readHumidity();
+    float t2 = dht2.readTemperature();
+    unsigned long nowMs = millis();
+    persistSingleSampleToFS(nowMs, t1, h1, t2, h2);
+    String resp = "{";
+    resp += "\"ts\":" + String(nowMs) + ",";
+    resp += "\"t1\":" + String(t1,2) + ",\"h1\":" + String(h1,2) + ",";
+    resp += "\"t2\":" + String(t2,2) + ",\"h2\":" + String(h2,2);
+    resp += "}";
+    dashboardServer.send(200, "application/json", resp);
+  });
   dashboardServer.begin();
   dashboardActive = true;
   Serial.println("Dashboard server started at /dashboard");
@@ -558,14 +810,22 @@ void startConfigPortal() {
   const char *apName = "ESP32-Setup";
   WiFi.disconnect(true);
   delay(100);
+  // perform a STA scan first (better results), then enable AP+STA for portal
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  configScanCount = WiFi.scanNetworks();
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apName);
   delay(200);
-  // scan networks for selection
-  configScanCount = WiFi.scanNetworks();
   // start web server
   configServer.on("/", handlePortalRoot);
   configServer.on("/save", HTTP_POST, handlePortalSave);
+  // allow explicit scan refresh via browser
+  configServer.on("/scan", HTTP_GET, [](){
+    configScanCount = WiFi.scanNetworks();
+    String resp = "<html><body><h3>Scan complete</h3><p>Found " + String(configScanCount) + " networks. <a href=\"/\">Back</a></p></body></html>";
+    configServer.send(200, "text/html", resp);
+  });
   configServer.begin();
   configPortalActive = true;
   Serial.print("Config portal started at "); Serial.println(WiFi.softAPIP());
@@ -614,7 +874,11 @@ void handleSerialCommand(const String &cmd) {
     int idx = relayNum - 1;
     digitalWrite(RELAY_PINS[idx], val ? HIGH : LOW);
     int readBack = digitalRead(RELAY_PINS[idx]);
-    if (relayFeeds[idx]) relayFeeds[idx]->save(readBack);
+    if (ensureMqttConnected()) {
+      char stateTopic[64];
+      snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", relayNum);
+      mqtt.publish(stateTopic, readBack ? "1" : "0");
+    }
     Serial.print("Serial: set relay "); Serial.print(relayNum);
     Serial.print(" -> "); Serial.print(val);
     Serial.print(" (pin "); Serial.print(RELAY_PINS[idx]); Serial.print(") read="); Serial.println(readBack);
@@ -636,7 +900,11 @@ void handleSerialCommand(const String &cmd) {
     vTaskDelay(pdMS_TO_TICKS(500));
     digitalWrite(RELAY_PINS[idx], before);
     int after = digitalRead(RELAY_PINS[idx]);
-    if (relayFeeds[idx]) relayFeeds[idx]->save(after);
+    if (ensureMqttConnected()) {
+      char stateTopic[64];
+      snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", relayNum);
+      mqtt.publish(stateTopic, after ? "1" : "0");
+    }
     Serial.print("Serial: pulse done relay "); Serial.print(relayNum);
     Serial.print(" read="); Serial.println(after);
     return;
@@ -713,6 +981,10 @@ void handleSerialCommand(const String &cmd) {
     }
     String ssid = WiFi.SSID(idx);
     Serial.print("Attempting to join '"); Serial.print(ssid); Serial.println("'...");
+    if (pass.length() > 0 && !(pass.length() >= 8 || pass.length() == 64)) {
+      Serial.println("Refusing to join: password too short for WPA2 Personal (min 8 chars).");
+      return;
+    }
     WiFi.begin(ssid.c_str(), pass.c_str());
     unsigned long start = millis();
     const unsigned long JOIN_TIMEOUT = 20000; // 20s
@@ -723,9 +995,8 @@ void handleSerialCommand(const String &cmd) {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
-      // reconnect Adafruit IO
-      if (!io) initAdafruitIO();
-      if (io) io->connect();
+      // ensure MQTT connection
+      ensureMqttConnected();
     } else {
       Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
       Serial.print("WiFi status="); Serial.println(WiFi.status());
@@ -745,6 +1016,10 @@ void handleSerialCommand(const String &cmd) {
     String ssid = rest.substring(0, space2);
     String pass = rest.substring(space2 + 1);
     Serial.print("Attempting to join '"); Serial.print(ssid); Serial.println("'...");
+    if (pass.length() > 0 && !(pass.length() >= 8 || pass.length() == 64)) {
+      Serial.println("Refusing to join: password too short for WPA2 Personal (min 8 chars).");
+      return;
+    }
     WiFi.begin(ssid.c_str(), pass.c_str());
     unsigned long start = millis();
     const unsigned long JOIN_TIMEOUT = 20000; // 20s
@@ -755,8 +1030,7 @@ void handleSerialCommand(const String &cmd) {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
-      if (!io) initAdafruitIO();
-      if (io) io->connect();
+      ensureMqttConnected();
     } else {
       Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
       Serial.print("WiFi status="); Serial.println(WiFi.status());
@@ -802,11 +1076,21 @@ void handleSerialCommand(const String &cmd) {
     }
     String ssid = rest.substring(0, space);
     String pass = rest.substring(space + 1);
+    // Require WPA2 Personal passphrase when provided
+    if (pass.length() > 0 && !(pass.length() >= 8 || pass.length() == 64)) {
+      Serial.println("Refusing to save: password too short for WPA2 Personal (min 8 chars).");
+      return;
+    }
     prefs.begin("wifi", false);
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
     prefs.end();
     Serial.print("Saved WiFi credentials for: "); Serial.println(ssid);
+    // verify readback
+    prefs.begin("wifi", true);
+    String check_ssid = prefs.getString("ssid", "");
+    prefs.end();
+    Serial.print("Verified saved SSID: "); Serial.println(check_ssid);
     Serial.print("Attempting to connect to '"); Serial.print(ssid); Serial.println("'...");
     WiFi.begin(ssid.c_str(), pass.c_str());
     unsigned long start = millis();
@@ -818,9 +1102,7 @@ void handleSerialCommand(const String &cmd) {
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("Connected, IP: "); Serial.println(WiFi.localIP());
-      // re-init Adafruit IO / MQTT
-      if (!io) initAdafruitIO();
-      if (io) io->connect();
+      ensureMqttConnected();
     } else {
       Serial.print("Failed to connect to '"); Serial.print(ssid); Serial.println("'");
       Serial.print("WiFi status="); Serial.println(WiFi.status());
@@ -828,36 +1110,29 @@ void handleSerialCommand(const String &cmd) {
     return;
   }
 
-  // aio set <user> <key>  -> store Adafruit IO credentials to NVS and reconnect
-  if (s.startsWith("aio set ")) {
-    String rest = s.substring(8);
-    int space = rest.indexOf(' ');
-    if (space < 1) {
-      Serial.println("Usage: aio set <username> <key>");
-      return;
+  // schedule show -> print loaded schedule entries
+  if (s == "schedule show") {
+    Serial.print("Schedule entries (count="); Serial.print(scheduleCount); Serial.println("):");
+    for (int i = 0; i < scheduleCount; ++i) {
+      Serial.print(i); Serial.print(": used="); Serial.print(scheduleEvents[i].used);
+      Serial.print(" ts="); Serial.print(scheduleEvents[i].ts);
+      Serial.print(" epoch_ms="); Serial.print(scheduleEvents[i].epoch_ms);
+      Serial.print(" relay="); Serial.print(scheduleEvents[i].relay);
+      Serial.print(" dur="); Serial.println(scheduleEvents[i].duration);
     }
-    String user = rest.substring(0, space);
-    String key = rest.substring(space + 1);
-    prefs.begin("aio", false);
-    prefs.putString("user", user);
-    prefs.putString("key", key);
-    prefs.end();
-    Serial.println("Saved AIO credentials to NVS. Reinitializing Adafruit IO...");
-    if (io) {
-      io->wifi_disconnect();
-      delete io;
-      io = nullptr;
+    // pending offs
+    Serial.println("Pending offs:");
+    for (int p = 0; p < 6; ++p) {
+      Serial.print(p); Serial.print(": active="); Serial.print(pendingOffs[p].active);
+      Serial.print(" relay="); Serial.print(pendingOffs[p].relay);
+      Serial.print(" end_ts="); Serial.println(pendingOffs[p].end_ts);
     }
-    initAdafruitIO();
-    if (io) io->connect();
     return;
   }
 
-  if (s == "aio show") {
-    prefs.begin("aio", true);
-    String user = prefs.getString("user", "(none)");
-    prefs.end();
-    Serial.print("AIO user: "); Serial.println(user);
+  // Adafruit IO removed — 'aio' serial commands deprecated
+  if (s.startsWith("aio ")) {
+    Serial.println("Adafruit IO integration removed from firmware. 'aio' commands are deprecated.");
     return;
   }
 
@@ -922,8 +1197,13 @@ void setup() {
   Serial.println();
   Serial.println("=== ESP32-S3 Relay-6CH Firmware ===");
   Serial.print("Build: "); Serial.print(__DATE__); Serial.print(" "); Serial.println(__TIME__);
-  Serial.print("AIO user: "); Serial.println(AIO_USERNAME);
+  // Adafruit IO integration removed
   Serial.println("Starting...\n");
+  // Print stored WiFi SSID at boot for diagnostics
+  prefs.begin("wifi", true);
+  String boot_ssid = prefs.getString("ssid", "(none)");
+  prefs.end();
+  Serial.print("Stored WiFi SSID (boot): "); Serial.println(boot_ssid);
   // Start frequent early prints while setup continues
   startEarlyBootPrints();
 
@@ -981,54 +1261,59 @@ void setup() {
     Serial.println("Starting configuration portal. Use serial 'wportal' to start later or connect to the AP.");
     startConfigPortal();
   }
-
-  // Initialize and connect to Adafruit IO (will use WiFi if available)
-  initAdafruitIO();
-  if (io) io->connect();
-  // report Adafruit IO connection status
-  if (io) {
-    Serial.print("Adafruit IO status: ");
-    Serial.println(io->statusText());
-  }
+  
 
   // Initialize DHT sensors
   dht1.begin();
   dht2.begin();
   Serial.println("DHT sensors initialized");
 
-  // Attach a message handler to the feed
-  if (ledFeed) ledFeed->onMessage(handleMessage);
-
-  // Attach handlers to existing relay feeds (created in initAdafruitIO)
-  if (relayFeeds[0]) relayFeeds[0]->onMessage(handleRelay1);
-  if (relayFeeds[1]) relayFeeds[1]->onMessage(handleRelay2);
-  if (relayFeeds[2]) relayFeeds[2]->onMessage(handleRelay3);
-  if (relayFeeds[3]) relayFeeds[3]->onMessage(handleRelay4);
-  if (relayFeeds[4]) relayFeeds[4]->onMessage(handleRelay5);
-  if (relayFeeds[5]) relayFeeds[5]->onMessage(handleRelay6);
+  // Adafruit IO removed — use MQTT topics for remote commands/state
 
   // Initialize relay pins and publish their initial states
   for (uint8_t i = 0; i < 6; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], LOW);
     delay(10);
-    // publish initial state
-    relayFeeds[i]->save(0);
+    // publish initial state via MQTT
+    if (ensureMqttConnected()) {
+      char stateTopic[64];
+      snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%u", i+1);
+      mqtt.publish(stateTopic, "0");
+    }
   }
 
   // Initialize RGB LED (WS2812) on GPIO38 using Adafruit NeoPixel
   strip.begin();
   strip.setPixelColor(0, strip.Color(0,0,0));
   strip.show();
-  // attach handler to rgb feed
-  if (rgbFeed) rgbFeed->onMessage(handleRGB);
-  // publish initial rgb
+  // publish initial rgb via MQTT
   publishRGB();
 
   // If already connected to WiFi, start dashboard
   if (WiFi.status() == WL_CONNECTED && !configPortalActive) {
     startDashboardServer();
   }
+
+  // Initialize in-memory schedule and pending offs
+  initPendingOffs();
+  // Try to synchronize time via NTP so epoch-based schedules work
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Attempting SNTP time sync...");
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    unsigned long tstart = millis();
+    while (millis() - tstart < 5000) {
+      time_t now = time(NULL);
+      if (now > 1600000000) {
+        haveEpoch = true;
+        Serial.println("SNTP time acquired");
+        break;
+      }
+      delay(200);
+    }
+    if (!haveEpoch) Serial.println("SNTP not available; epoch schedules will be ignored");
+  }
+  loadScheduleFromFS();
 
   // Signal the early-print task to stop and give it a short time to exit
   stopEarlyPrint = true;
@@ -1054,8 +1339,7 @@ void loop() {
     }
   }
 
-  // Required to maintain the connection to Adafruit IO
-  if (io) io->run();
+  // Adafruit IO removed; skip io run loop
 
   // Maintain MQTT connection and loop
   if (ensureMqttConnected()) {
@@ -1069,17 +1353,48 @@ void loop() {
 
   // If not connected, try periodic reconnects and fall back to config portal
   if (WiFi.status() != WL_CONNECTED && !configPortalActive) {
-    if ((millis() - lastWiFiAttempt) >= WIFI_RETRY_INTERVAL) {
-      if (wifiRetryCount < WIFI_MAX_RETRIES) {
-        Serial.println("WiFi disconnected, attempting reconnect...");
+    unsigned long now = millis();
+    // Normal retry window: attempt reconnects frequently up to WIFI_MAX_RETRIES
+    if (!wifiInFallback) {
+      if ((now - lastWiFiAttempt) >= WIFI_RETRY_INTERVAL) {
+        if (wifiRetryCount < WIFI_MAX_RETRIES) {
+          Serial.println("WiFi disconnected, attempting reconnect...");
+          bool ok = tryConnectWiFiOnce();
+          if (ok) {
+            ensureMqttConnected();
+            // reset fallback state in case it was set previously
+            wifiInFallback = false;
+            wifiFailureStart = 0;
+          }
+        } else {
+          // enter fallback mode (handled in event too)
+          if (!wifiInFallback) {
+            wifiInFallback = true;
+            wifiFailureStart = now;
+            Serial.println("WiFi failed after retries; entering fallback reconnect mode.");
+          }
+        }
+      }
+    } else {
+      // In fallback mode: attempt a full connect cycle every WIFI_FALLBACK_INTERVAL
+      if ((now - lastWiFailureCheck) >= WIFI_FALLBACK_INTERVAL) {
+        Serial.println("Fallback: attempting full WiFi connect cycle...");
+        lastWiFailureCheck = now;
         bool ok = tryConnectWiFiOnce();
         if (ok) {
-          if (!io) initAdafruitIO();
-          if (io) io->connect();
+          Serial.println("Fallback: reconnected successfully");
+          ensureMqttConnected();
+          wifiInFallback = false;
+          wifiFailureStart = 0;
+          wifiRetryCount = 0;
+        } else {
+          Serial.println("Fallback: connect attempt failed");
+          // if we've exceeded the total timeout, open the config portal
+          if (now - wifiFailureStart >= WIFI_TOTAL_RETRY_TIMEOUT) {
+            Serial.println("Fallback: total retry timeout reached; starting config portal");
+            startConfigPortal();
+          }
         }
-      } else {
-        Serial.println("WiFi failed after retries; starting config portal.");
-        startConfigPortal();
       }
     }
   }
@@ -1107,7 +1422,11 @@ void loop() {
         // turn on current relay
         int idx = cycleIndex;
         digitalWrite(RELAY_PINS[idx], HIGH);
-        if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+        if (ensureMqttConnected()) {
+          char stateTopic[64];
+          snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", idx+1);
+          mqtt.publish(stateTopic, digitalRead(RELAY_PINS[idx]) ? "1" : "0");
+        }
         Serial.print("Cycle: relay on "); Serial.println(idx+1);
         cycleState = 1;
         lastCycleMillis = nowMillis;
@@ -1117,7 +1436,11 @@ void loop() {
         // turn off current relay and advance
         int idx = cycleIndex;
         digitalWrite(RELAY_PINS[idx], LOW);
-        if (relayFeeds[idx]) relayFeeds[idx]->save(digitalRead(RELAY_PINS[idx]));
+        if (ensureMqttConnected()) {
+          char stateTopic[64];
+          snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", idx+1);
+          mqtt.publish(stateTopic, digitalRead(RELAY_PINS[idx]) ? "1" : "0");
+        }
         Serial.print("Cycle: relay off "); Serial.println(idx+1);
         cycleIndex = (cycleIndex + 1) % 6;
         cycleState = 0;
@@ -1133,11 +1456,8 @@ void loop() {
     int value = random(0, 2);
     Serial.print("Publishing: ");
     Serial.println(value);
-    if (io && WiFi.status() == WL_CONNECTED) {
-      if (ledFeed) ledFeed->save(value);
-    } else {
-      Serial.println("Publish skipped: Adafruit IO not connected");
-    }
+    // Publish via MQTT (telemetry)
+    // (Adafruit IO removed)
     // Publish via MQTT as well (telemetry placeholder)
     if (ensureMqttConnected()) {
       char buf[128];
@@ -1151,7 +1471,8 @@ void loop() {
     lastDHT = millis();
     Serial.println("--- Status & DHT readings ---");
     // Board status
-    Serial.print("Uptime (s): "); Serial.println(millis() / 1000);
+    unsigned long up_s = millis() / 1000;
+    Serial.print("Uptime: "); Serial.println(formatUptime(up_s));
     Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
     Serial.print("WiFi IP: ");
     if (WiFi.status() == WL_CONNECTED) Serial.println(WiFi.localIP()); else Serial.println("not connected");
@@ -1179,7 +1500,106 @@ void loop() {
       snprintf(payload, sizeof(payload), "{\"t1\":%.2f,\"h1\":%.2f,\"t2\":%.2f,\"h2\":%.2f}", t1, h1, t2, h2);
       mqtt.publish(MQTT_TELEMETRY_TOPIC, payload);
     }
+    // Append to in-memory circular buffer
+    unsigned long nowMs = millis();
+    appendSample(nowMs, t1, h1, t2, h2);
+    // Persist one sample every PERSIST_INTERVAL_MS to SPIFFS for server retrieval
+    if ((millis() - lastPersist) >= PERSIST_INTERVAL_MS) {
+      persistSingleSampleToFS(nowMs, t1, h1, t2, h2);
+      lastPersist = millis();
+    }
+    // Print relay states as part of status block so serial shows current relay states
+    Serial.println("Relay states:");
+    for (int i = 0; i < 6; ++i) {
+      Serial.print("r"); Serial.print(i+1);
+      Serial.print(" (pin "); Serial.print(RELAY_PINS[i]); Serial.print(") = ");
+      Serial.println(digitalRead(RELAY_PINS[i]));
+    }
     Serial.println("-----------------------------");
+  }
+  // Schedule execution: check for due events and pending off timers
+  unsigned long now = millis();
+  // If we don't yet have epoch time, attempt a quick SNTP check occasionally
+  static unsigned long lastEpochCheck = 0;
+  if (!haveEpoch && (millis() - lastEpochCheck) > 5000) {
+    lastEpochCheck = millis();
+    time_t nowt = time(NULL);
+    if (nowt > 1600000000) {
+      haveEpoch = true;
+      Serial.println("NTP time now available; will convert epoch-based schedules");
+      // convert any stored epoch_ms entries to device-relative ts
+      unsigned long long nowEpochMs = getCurrentEpochMs();
+      for (int i = 0; i < scheduleCount; ++i) {
+        if (!scheduleEvents[i].used) continue;
+        if (scheduleEvents[i].epoch_ms > 0ULL && scheduleEvents[i].ts == 0) {
+          if (scheduleEvents[i].epoch_ms <= nowEpochMs) {
+            Serial.print("Dropping past schedule epoch_ms: "); Serial.println(scheduleEvents[i].epoch_ms);
+            scheduleEvents[i].used = false;
+          } else {
+            unsigned long delta = (unsigned long)(scheduleEvents[i].epoch_ms - nowEpochMs);
+            scheduleEvents[i].ts = millis() + delta;
+            scheduleEvents[i].epoch_ms = 0ULL;
+            Serial.print("Converted epoch schedule to ts in ms: "); Serial.println(scheduleEvents[i].ts);
+          }
+        }
+      }
+    }
+  }
+  // Process pending offs
+  for (int i = 0; i < 6; ++i) {
+    if (pendingOffs[i].active && now >= pendingOffs[i].end_ts) {
+      int pin = RELAY_PINS[pendingOffs[i].relay - 1];
+      digitalWrite(pin, LOW);
+      if (ensureMqttConnected()) {
+        char stateTopic[64];
+        snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", pendingOffs[i].relay);
+        mqtt.publish(stateTopic, "0");
+      }
+      Serial.print("Scheduled off: relay "); Serial.print(pendingOffs[i].relay); Serial.println(" -> OFF");
+      pendingOffs[i].active = false;
+    }
+  }
+  // Process schedule events (one-shot)
+  bool scheduleModified = false;
+  for (int i = 0; i < scheduleCount; ++i) {
+    if (!scheduleEvents[i].used) continue;
+    if (now >= scheduleEvents[i].ts) {
+      // Trigger relay
+      uint8_t relay = scheduleEvents[i].relay;
+      if (relay >= 1 && relay <= 6) {
+        int pin = RELAY_PINS[relay - 1];
+        digitalWrite(pin, HIGH);
+        Serial.print("Scheduled on: relay "); Serial.print(relay); Serial.print(" duration_ms="); Serial.println(scheduleEvents[i].duration);
+        if (ensureMqttConnected()) {
+          char stateTopic[64];
+          snprintf(stateTopic, sizeof(stateTopic), "esp32s3/state/relay%d", relay);
+          mqtt.publish(stateTopic, "1");
+        }
+        // set pending off
+        for (int p = 0; p < 6; ++p) {
+          if (!pendingOffs[p].active) {
+            pendingOffs[p].relay = relay;
+            pendingOffs[p].end_ts = now + scheduleEvents[i].duration;
+            pendingOffs[p].active = true;
+            break;
+          }
+        }
+      }
+      // handle repeating every 8 days: reschedule by adding 8 days to ts
+      if (scheduleEvents[i].repeat8) {
+        const unsigned long EIGHT_DAYS_MS = 8UL * 24UL * 3600UL * 1000UL;
+        // avoid overflow by computing relative
+        scheduleEvents[i].ts = now + EIGHT_DAYS_MS;
+        scheduleModified = true;
+      } else {
+        // mark event as used/consumed
+        scheduleEvents[i].used = false;
+        scheduleModified = true;
+      }
+    }
+  }
+  if (scheduleModified) {
+    saveScheduleToFS();
   }
   // Heartbeat: print alive every HEARTBEAT_INTERVAL
   if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
