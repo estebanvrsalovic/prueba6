@@ -11,3 +11,5 @@ include/credentials.h
 web/node_modules/
 web/server.log
 web/data/
+.vercel
+.env*.local
