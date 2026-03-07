@@ -21,6 +21,8 @@ const io = new Server(server, {
 });
 // store last-known relay states so new web clients can be initialized
 const lastRelayStates = {};
+// pending file responses map: key = `${deviceId}:${reqId}` => { resolve, timer }
+const pendingFileResponses = {};
 
 // Normalize human-friendly states to device values for publishing
 function normalizeStateForDevice(val) {
@@ -39,6 +41,7 @@ function normalizeStateForDevice(val) {
 const MQTT_BROKER = process.env.MQTT_BROKER || 'mqtt://test.mosquitto.org:1883';
 const MQTT_TELEMETRY_TOPIC = process.env.MQTT_TELEMETRY_TOPIC || 'esp32s3/telemetry';
 const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'esp32s3/state/#';
+const MQTT_FILE_RESPONSE_TOPIC = 'esp32s3/file/response/#';
 // When set, forward frontend API calls to Supabase Edge Functions base URL
 // Example: https://xyz.supabase.co/functions/v1
 const SUPABASE_FUNCTIONS_BASE = process.env.SUPABASE_FUNCTIONS_BASE || '';
@@ -154,6 +157,31 @@ app.get('/history', (req, res) => {
       // return chronological order
       res.json(rows.reverse());
     });
+  }
+});
+
+// Request a file from a device over MQTT. Returns JSON with content_base64 and content_type.
+app.post('/api/device_file', async (req, res) => {
+  try {
+    const { device_id, path } = req.body;
+    if (!device_id || !path) return res.status(400).json({ error: 'device_id and path required' });
+    const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+    const topicReq = `esp32s3/file/request/${device_id}`;
+    const payload = JSON.stringify({ path, req_id: reqId });
+    const key = `${device_id}:${reqId}`;
+    // publish request
+    client.publish(topicReq, payload, { qos: 0 }, (err) => {
+      if (err) console.error('Publish file request error', err);
+    });
+    // wait for response (with timeout)
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { delete pendingFileResponses[key]; reject(new Error('timeout')); }, 10000);
+      pendingFileResponses[key] = { resolve, timer };
+    });
+    return res.json(result);
+  } catch (e) {
+    console.error('POST /api/device_file error', e);
+    return res.status(500).json({ error: e.toString() });
   }
 });
 
@@ -370,11 +398,42 @@ client.on('connect', () => {
   client.subscribe('esp32s3/schedule/loaded', { qos: 0 }, (err) => {
     if (err) console.error('Subscribe schedule/loaded error', err);
   });
+  // subscribe to file responses from devices
+  client.subscribe(MQTT_FILE_RESPONSE_TOPIC, { qos: 0 }, (err) => {
+    if (err) console.error('Subscribe file response error', err);
+  });
 });
 
 client.on('message', (topic, message) => {
   const payload = message.toString();
-  console.log('MQTT', topic, payload);
+  console.log(new Date().toISOString(), 'MQTT message ->', topic);
+  try {
+    // try to pretty-print JSON payloads
+    const parsed = JSON.parse(payload);
+    console.log('MQTT payload (json):', parsed);
+  } catch (e) {
+    console.log('MQTT payload (raw):', payload);
+  }
+  // File response handling: topic format esp32s3/file/response/<device_id>/<req_id>
+  if (topic.startsWith('esp32s3/file/response/')) {
+    // extract req_id
+    const parts = topic.split('/');
+    // parts[0]=esp32s3, [1]=file, [2]=response, [3]=device_id, [4]=req_id
+    const deviceId = parts[3];
+    const reqId = parts[4];
+    try {
+      const obj = JSON.parse(payload);
+      const key = `${deviceId}:${reqId}`;
+      if (pendingFileResponses[key]) {
+        pendingFileResponses[key].resolve(obj);
+        clearTimeout(pendingFileResponses[key].timer);
+        delete pendingFileResponses[key];
+      }
+    } catch (e) {
+      console.error('Invalid JSON in file response', e);
+    }
+    return;
+  }
   if (topic === MQTT_TELEMETRY_TOPIC) {
     // try to parse JSON
     let obj = payload;
