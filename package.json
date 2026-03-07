@@ -1,0 +1,7 @@
+{
+  "name": "prueba6-root",
+  "version": "0.0.0",
+  "scripts": {
+    "start": "node web/server.js"
+  }
+}

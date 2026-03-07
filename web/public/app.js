@@ -1,4 +1,4 @@
-const socket = io();
+const socket = window.socket || (window.socket = io());
 
 const telemetryEl = document.getElementById('telemetry');
 const rawEl = document.getElementById('raw');

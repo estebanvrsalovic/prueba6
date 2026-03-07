@@ -46,8 +46,16 @@ const MQTT_FILE_RESPONSE_TOPIC = 'esp32s3/file/response/#';
 // Example: https://xyz.supabase.co/functions/v1
 const SUPABASE_FUNCTIONS_BASE = process.env.SUPABASE_FUNCTIONS_BASE || '';
 
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
+
+// Expose supabase client config to the frontend if set (otherwise return empty values)
+app.get('/api/supabase-config', (req, res) => {
+  return res.json({
+    SUPABASE_URL: process.env.SUPABASE_URL || '',
+    SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || ''
+  });
+});
 
 // ensure data directory exists
 const DATA_DIR = path.join(__dirname, 'data');

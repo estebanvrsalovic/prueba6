@@ -45,10 +45,10 @@
       } catch (e) { historyEl.textContent = 'Error cargando historial: ' + e; }
     }
 
-    // Real time via socket.io
-    const socket = io();
-    socket.on('connect', () => { console.log('socket connected'); });
-    socket.on('telemetry', (data) => { renderEntry(data, true); });
+    // Real time via socket.io (reuse shared window.socket to avoid duplicate declarations)
+    const s = window.socket || (window.socket = io());
+    s.on('connect', () => { console.log('socket connected'); });
+    s.on('telemetry', (data) => { renderEntry(data, true); });
 
     loadHistory();
   </script>
