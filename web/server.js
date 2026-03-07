@@ -386,6 +386,12 @@ io.on('connection', (socket) => {
 console.log('Connecting to MQTT broker', MQTT_BROKER);
 const client = mqtt.connect(MQTT_BROKER);
 
+client.on('error', (err) => {
+  console.error('MQTT client error', err && err.message ? err.message : err);
+});
+client.on('reconnect', () => { console.log('MQTT client reconnecting'); });
+client.on('close', () => { console.log('MQTT client closed'); });
+
 client.on('connect', () => {
   console.log('Connected to MQTT broker');
   client.subscribe(MQTT_TELEMETRY_TOPIC, { qos: 0 }, (err) => {
@@ -584,6 +590,18 @@ app.post('/api/command', (req, res) => {
   } catch (e) {
     console.error('HTTP /api/command error', e);
     res.status(500).json({ error: e.toString() });
+  }
+});
+
+// Debug endpoint: emit arbitrary telemetry to connected web clients (not for production)
+app.post('/_debug/emit', (req, res) => {
+  try {
+    const payload = req.body || {};
+    io.emit('telemetry', payload);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Debug emit failed', e);
+    return res.status(500).json({ error: e.toString() });
   }
 });
 
