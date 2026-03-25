@@ -51,7 +51,8 @@ Preferences prefs;
 // MQTT client (optional)
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
-const char *MQTT_BROKER = "test.mosquitto.org";
+// Force IPv4 public test broker IP to avoid IPv6/resolution issues during debugging
+const char *MQTT_BROKER = "54.36.178.49";
 const uint16_t MQTT_PORT = 1883;
 
 // Publish topics

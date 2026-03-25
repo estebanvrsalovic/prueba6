@@ -3,7 +3,9 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
+#include <DHT.h>
 #include <vector>
+#include <memory>
 #include <cstring>
 #include <WiFiClient.h>
 #include <PubSubClient.h>
@@ -31,6 +33,18 @@ const int MQTT_BROKER_PORT = MQTT_BROKER_PORT;
 
 WiFiClient espWifiClient;
 PubSubClient mqttClient(espWifiClient);
+
+// DHT sensors (DHT22)
+static const int DHT1_PIN = 15;
+static const int DHT2_PIN = 16;
+static const int DHT_TYPE = DHT22;
+DHT dht1(DHT1_PIN, DHT_TYPE);
+DHT dht2(DHT2_PIN, DHT_TYPE);
+// last-known readings (used as fallback when read fails)
+float last_t1 = 0.0f;
+float last_h1 = 0.0f;
+float last_t2 = 0.0f;
+float last_h2 = 0.0f;
 
 // Simple base64 encoding for binary file contents
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -296,7 +310,39 @@ void sendTelemetry() {
   https.addHeader("Content-Type", "application/json");
   https.addHeader("x-telemetry-key", TELEMETRY_KEY);
 
-  String payload = "{\"device_id\":\"esp32s3-01\",\"t1\":23.4,\"h1\":52.1}";
+  // Read DHT sensors and update last-known values (fall back to last values on read error)
+  // Attempt multiple reads for more reliable DHT values
+  float t1 = NAN, h1 = NAN, t2 = NAN, h2 = NAN;
+  const int DHT_READ_ATTEMPTS = 3;
+  for (int a = 0; a < DHT_READ_ATTEMPTS; ++a) {
+    t1 = dht1.readTemperature();
+    h1 = dht1.readHumidity();
+    if (!isnan(t1) && !isnan(h1)) break;
+    delay(200);
+  }
+  if (!isnan(t1)) last_t1 = t1; else Serial.println("DHT1 read failed (NaN)");
+  if (!isnan(h1)) last_h1 = h1; else Serial.println("DHT1 humidity read failed (NaN)");
+  for (int a = 0; a < DHT_READ_ATTEMPTS; ++a) {
+    t2 = dht2.readTemperature();
+    h2 = dht2.readHumidity();
+    if (!isnan(t2) && !isnan(h2)) break;
+    delay(200);
+  }
+  if (!isnan(t2)) last_t2 = t2; else Serial.println("DHT2 read failed (NaN)");
+  if (!isnan(h2)) last_h2 = h2; else Serial.println("DHT2 humidity read failed (NaN)");
+
+  // Build JSON payload including t1/h1 (and t2/h2)
+  // Include diagnostic flags indicating whether last read was valid
+  bool dht1_ok = !isnan(t1) && !isnan(h1);
+  bool dht2_ok = !isnan(t2) && !isnan(h2);
+  String payload = "{\"device_id\":\"esp32s3-01\"";
+  payload += ",\"t1\":" + String(last_t1, 2);
+  payload += ",\"h1\":" + String(last_h1, 2);
+  payload += ",\"t2\":" + String(last_t2, 2);
+  payload += ",\"h2\":" + String(last_h2, 2);
+  payload += ",\"dht1_ok\":" + (dht1_ok ? "true" : "false");
+  payload += ",\"dht2_ok\":" + (dht2_ok ? "true" : "false");
+  payload += "}";
   // Publish immediately to MQTT relay so server UI can receive telemetry even
   // if HTTP delivery is delayed. MQTT publish is best-effort here.
   if (mqttClient.connected()) {
@@ -408,6 +454,10 @@ void setup() {
 
   // attempt MQTT connection
   mqttConnectAndSubscribe();
+
+  // initialize DHT sensors
+  dht1.begin();
+  dht2.begin();
 }
 
 void loop() {

@@ -1,60 +1,4 @@
 <!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ESP32 Telemetry</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#f7f7f8;color:#111;padding:18px}
-    h1{margin:0 0 12px}
-    .entry{padding:8px;border-radius:6px;background:#fff;margin:8px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-    .ts{font-size:12px;color:#666}
-    #live{list-style:none;padding:0;margin:8px 0}
-  </style>
-</head>
-<body>
-  <h1>ESP32 Telemetry</h1>
-  <p>Últimos registros (historial) y actualizaciones en tiempo real.</p>
-  <div id="history"></div>
-  <h2>En vivo</h2>
-  <ul id="live"></ul>
-
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    const historyEl = document.getElementById('history');
-    const liveEl = document.getElementById('live');
-
-    function fmtTs(ts){
-      try { return new Date(Number(ts)).toLocaleString(); } catch(e){ return String(ts); }
-    }
-
-    function renderEntry(obj, prepend=false){
-      const li = document.createElement('li'); li.className='entry';
-      const t = document.createElement('div'); t.className='ts'; t.textContent = fmtTs(obj.ts || obj.server_ts || obj.device_ts || Date.now());
-      const body = document.createElement('div');
-      try { body.textContent = JSON.stringify(obj); } catch(e){ body.textContent = String(obj); }
-      li.appendChild(t); li.appendChild(body);
-      if (prepend) liveEl.insertBefore(li, liveEl.firstChild); else historyEl.appendChild(li);
-    }
-
-    async function loadHistory(){
-      try {
-        const res = await fetch('/history?n=50');
-        const arr = await res.json();
-        arr.forEach(a => renderEntry(a, false));
-      } catch (e) { historyEl.textContent = 'Error cargando historial: ' + e; }
-    }
-
-    // Real time via socket.io (reuse shared window.socket to avoid duplicate declarations)
-    const s = window.socket || (window.socket = io());
-    s.on('connect', () => { console.log('socket connected'); });
-    s.on('telemetry', (data) => { renderEntry(data, true); });
-
-    loadHistory();
-  </script>
-</body>
-</html>
-<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -185,6 +129,24 @@
   <div class="box">
     <h4>Raw MQTT messages</h4>
     <pre id="raw">(no messages yet)</pre>
+  </div>
+  <div class="box" id="history-box">
+    <h4>Mediciones históricas</h4>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label>Mostrar últimas <input id="hist-n" type="number" value="50" min="1" max="1000" style="width:80px;margin-left:6px"> entradas</label>
+      <button id="btn-load-history" class="btn">Cargar</button>
+      <button id="btn-clear-history" class="btn ghost">Limpiar tabla</button>
+    </div>
+    <div style="margin-top:8px;overflow:auto;max-height:320px">
+      <table id="history-table" style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:13px">
+            <th>Fecha</th><th>t1 (°C)</th><th>h1 (%)</th><th>t2 (°C)</th><th>h2 (%)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
   <script src="https://cdn.socket.io/4.7.1/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
