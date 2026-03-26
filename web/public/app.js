@@ -273,6 +273,31 @@ btnLoadHistory && btnLoadHistory.addEventListener('click', () => {
 });
 btnClearHistory && btnClearHistory.addEventListener('click', () => { historyTableBody.innerHTML = ''; });
 
+// Send a small test telemetry POST to `/api/telemetry` for end-to-end validation
+const btnSendTest = document.getElementById('btn-send-test-telemetry');
+if (btnSendTest) btnSendTest.addEventListener('click', async () => {
+  try {
+    const sample = {
+      ts: new Date().toISOString(),
+      t1: (20 + Math.random()*5).toFixed(2),
+      h1: (40 + Math.random()*10).toFixed(2),
+      t2: (19 + Math.random()*4).toFixed(2),
+      h2: (45 + Math.random()*8).toFixed(2)
+    };
+    pushRaw('Posting test telemetry -> /api/telemetry');
+    const r = await fetch('/api/telemetry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sample) });
+    if (!r.ok) {
+      pushRaw('Test telemetry failed: ' + r.status + ' ' + r.statusText);
+      alert('Test telemetry POST failed: ' + r.status + ' ' + r.statusText);
+      return;
+    }
+    pushRaw('Test telemetry posted (server accepted)');
+    alert('Test telemetry posted');
+  } catch (err) {
+    console.error('Test telemetry error', err); pushRaw('Test telemetry error: ' + String(err)); alert('Test telemetry error: ' + String(err));
+  }
+});
+
 // expose small helper for initial load if desired
 window.loadHistory = loadHistory;
 
