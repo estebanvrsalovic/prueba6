@@ -113,7 +113,11 @@ module.exports = async (req, res) => {
     }
     return res.status(503).json({ error: 'no persistence backend configured (DATABASE_URL or SUPABASE_URL + SERVICE_ROLE required)' });
   } catch (err) {
-    console.error('Telemetry ingestion error', err);
-    return res.status(500).json({ error: String(err) });
+    // Log full error and return more detailed info for debugging in preview
+    console.error('Telemetry ingestion error', err && err.stack ? err.stack : err);
+    const errMessage = (err && err.message) ? err.message : String(err);
+    const errStack = (err && err.stack) ? err.stack : null;
+    const errDetails = (err && err.details) ? err.details : null;
+    return res.status(500).json({ error: errMessage, stack: errStack, details: errDetails });
   }
 };
