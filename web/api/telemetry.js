@@ -1,15 +1,24 @@
 const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js');
 
 // Serverless telemetry ingestion for Vercel
-// Expects env var DATABASE_URL (Postgres). If TELEMETRY_KEY is set, requires
-// requests to include header `x-telemetry-key` with that value.
+// Supports two backends:
+//  - Postgres via DATABASE_URL (preferred)
+//  - Supabase via SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY
 
 const DATABASE_URL = process.env.DATABASE_URL || null;
+const SUPABASE_URL = process.env.SUPABASE_URL || null;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
 const TELEMETRY_KEY = process.env.TELEMETRY_KEY || null;
 
 let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+}
+
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 }
 
 function parseBody(raw) {
@@ -23,35 +32,14 @@ function parseBody(raw) {
     const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
     const out = [];
     for (const ln of lines) {
-      try { out.push(JSON.parse(ln)); } catch (err) { /* skip */ }
+      try { out.push(JSON.parse(ln)); } catch (err) { /* skip invalid lines */ }
     }
     return out;
   }
   return [];
 }
 
-module.exports = async (req, res) => {
-  // Allow POST only
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-
-  if (TELEMETRY_KEY) {
-    const keyHeader = req.headers['x-telemetry-key'] || req.headers['x-api-key'] || req.headers['authorization'];
-    let key = null;
-    if (keyHeader) {
-      if (typeof keyHeader === 'string' && keyHeader.toLowerCase().startsWith('bearer ')) key = keyHeader.slice(7).trim();
-      else if (Array.isArray(keyHeader)) key = keyHeader[0];
-      else key = keyHeader;
-    }
-    if (!key || key !== TELEMETRY_KEY) return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  if (!pool) return res.status(503).json({ error: 'DATABASE_URL not configured; cannot persist telemetry in serverless environment' });
-
-  // read raw body text
-  const raw = typeof req.body === 'string' ? req.body : (req.body && Object.keys(req.body).length ? JSON.stringify(req.body) : '');
-  const entries = parseBody(raw);
-  if (!entries || entries.length === 0) return res.status(400).json({ error: 'no valid telemetry entries' });
-
+async function insertToPostgres(entries) {
   const now = Date.now();
   const client = await pool.connect();
   try {
@@ -69,70 +57,63 @@ module.exports = async (req, res) => {
       await client.query('INSERT INTO telemetry (ts, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [now, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
     }
     await client.query('COMMIT');
-    return res.json({ ok: true, received: entries.length });
+    return { ok: true, received: entries.length };
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Serverless telemetry insert error', err);
-    return res.status(500).json({ error: String(err) });
+    throw err;
   } finally {
     client.release();
   }
-};
-const { createClient } = require('@supabase/supabase-js');
-
-// Use the SERVICE_ROLE key (server-side) configured in Vercel environment variables
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const TELEMETRY_KEY = process.env.TELEMETRY_KEY || null; // simple shared secret
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn('Supabase not configured for telemetry endpoint. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.');
 }
 
-const supabase = createClient(SUPABASE_URL || '', SUPABASE_SERVICE_ROLE_KEY || '');
+async function insertToSupabase(entries) {
+  // insert entries one by one using supabase service role (expects table telemetry schema)
+  for (const e of entries) {
+    const row = {
+      device_id: e.device_id || e.device || 'esp',
+      t1: (typeof e.t1 !== 'undefined') ? e.t1 : null,
+      h1: (typeof e.h1 !== 'undefined') ? e.h1 : null,
+      t2: (typeof e.t2 !== 'undefined') ? e.t2 : null,
+      h2: (typeof e.h2 !== 'undefined') ? e.h2 : null
+    };
+    const { error } = await supabase.from('telemetry').insert([row]);
+    if (error) throw error;
+  }
+  return { ok: true, received: entries.length };
+}
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  // simple auth: accept x-telemetry-key, x-api-key, or Authorization: Bearer <key>
+  // auth by shared key if configured
   if (TELEMETRY_KEY) {
     const keyHeader = req.headers['x-telemetry-key'] || req.headers['x-api-key'] || req.headers['authorization'];
     let key = null;
     if (keyHeader) {
-      if (typeof keyHeader === 'string' && keyHeader.toLowerCase().startsWith('bearer ')) {
-        key = keyHeader.slice(7).trim();
-      } else if (Array.isArray(keyHeader)) {
-        key = keyHeader[0];
-      } else {
-        key = keyHeader;
-      }
+      if (typeof keyHeader === 'string' && keyHeader.toLowerCase().startsWith('bearer ')) key = keyHeader.slice(7).trim();
+      else if (Array.isArray(keyHeader)) key = keyHeader[0];
+      else key = keyHeader;
     }
     if (!key || key !== TELEMETRY_KEY) return res.status(401).json({ error: 'unauthorized' });
   }
 
-  let body = req.body;
-  if (!body || Object.keys(body).length === 0) {
-    // try parse JSON body fallback
-    try { body = JSON.parse(req.rawBody || '{}'); } catch (err) { body = {}; }
-  }
-
-  const row = {
-    device_id: body.device_id || body.device || 'esp',
-    t1: (typeof body.t1 !== 'undefined') ? body.t1 : null,
-    h1: (typeof body.h1 !== 'undefined') ? body.h1 : null,
-    t2: (typeof body.t2 !== 'undefined') ? body.t2 : null,
-    h2: (typeof body.h2 !== 'undefined') ? body.h2 : null
-  };
+  // read raw body text (support raw text, JSON parsed body, or NDJSON)
+  const raw = typeof req.body === 'string' ? req.body : (req.body && Object.keys(req.body).length ? JSON.stringify(req.body) : (req.rawBody || ''));
+  const entries = parseBody(raw);
+  if (!entries || entries.length === 0) return res.status(400).json({ error: 'no valid telemetry entries' });
 
   try {
-    const { error } = await supabase.from('telemetry').insert([row]);
-    if (error) {
-      console.error('Supabase insert error', error.message);
-      return res.status(500).json({ error: error.message });
+    if (pool) {
+      const out = await insertToPostgres(entries);
+      return res.json(out);
     }
-    return res.status(200).json({ ok: true });
+    if (supabase) {
+      const out = await insertToSupabase(entries);
+      return res.json(out);
+    }
+    return res.status(503).json({ error: 'no persistence backend configured (DATABASE_URL or SUPABASE_URL + SERVICE_ROLE required)' });
   } catch (err) {
-    console.error('Telemetry endpoint error', err);
+    console.error('Telemetry ingestion error', err);
     return res.status(500).json({ error: String(err) });
   }
 };
