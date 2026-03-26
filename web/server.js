@@ -301,6 +301,89 @@ app.post('/api/device_file', async (req, res) => {
   }
 });
 
+// HTTP telemetry ingestion endpoint (accepts single object, array, or newline-delimited JSON)
+app.post('/api/telemetry', express.text({ type: '*/*' }), async (req, res) => {
+  const TELEMETRY_KEY = process.env.TELEMETRY_KEY || null;
+  if (TELEMETRY_KEY) {
+    const keyHeader = req.headers['x-telemetry-key'] || req.headers['x-api-key'] || req.headers['authorization'];
+    let key = null;
+    if (keyHeader) {
+      if (typeof keyHeader === 'string' && keyHeader.toLowerCase().startsWith('bearer ')) key = keyHeader.slice(7).trim();
+      else if (Array.isArray(keyHeader)) key = keyHeader[0];
+      else key = keyHeader;
+    }
+    if (!key || key !== TELEMETRY_KEY) return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  let raw = req.body || '';
+  // try to parse JSON body
+  const parseJson = (s) => { try { return JSON.parse(s); } catch (e) { return null; } };
+  let entries = [];
+  const parsed = parseJson(raw);
+  if (parsed && Array.isArray(parsed)) entries = parsed;
+  else if (parsed && typeof parsed === 'object') entries = [parsed];
+  else {
+    // try newline-delimited JSON
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    for (const ln of lines) {
+      const p = parseJson(ln);
+      if (p) entries.push(p);
+    }
+  }
+
+  if (entries.length === 0) return res.status(400).json({ error: 'no valid telemetry entries found' });
+
+  const now = Date.now();
+  // normalize and insert each entry
+  try {
+    if (usingPg) {
+      (async () => {
+        const clientPg = await pgPool.connect();
+        try {
+          await clientPg.query('BEGIN');
+          for (const e of entries) {
+            const device_ts = (typeof e.t !== 'undefined') ? Number(e.t) : null;
+            const t1 = (typeof e.t1 !== 'undefined') ? Number(e.t1) : null;
+            const h1 = (typeof e.h1 !== 'undefined') ? Number(e.h1) : null;
+            const t2 = (typeof e.t2 !== 'undefined') ? Number(e.t2) : null;
+            const h2 = (typeof e.h2 !== 'undefined') ? Number(e.h2) : null;
+            const dht1_ok = (typeof e.dht1_ok !== 'undefined') ? (e.dht1_ok ? 1 : 0) : null;
+            const dht2_ok = (typeof e.dht2_ok !== 'undefined') ? (e.dht2_ok ? 1 : 0) : null;
+            // skip entries without numeric sensors
+            const hasSensor = [t1, h1, t2, h2].some(v => v !== null && Number.isFinite(v));
+            if (!hasSensor) continue;
+            await clientPg.query('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2,dht1_ok,dht2_ok) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [now, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+          }
+          await clientPg.query('COMMIT');
+        } catch (e) {
+          await clientPg.query('ROLLBACK');
+          console.error('PG batch telemetry insert error', e);
+        } finally {
+          clientPg.release();
+        }
+      })();
+    } else {
+      // sqlite: enqueue each entry into serialized queue
+      for (const e of entries) {
+        const device_ts = (typeof e.t !== 'undefined') ? Number(e.t) : null;
+        const t1 = (typeof e.t1 !== 'undefined') ? Number(e.t1) : null;
+        const h1 = (typeof e.h1 !== 'undefined') ? Number(e.h1) : null;
+        const t2 = (typeof e.t2 !== 'undefined') ? Number(e.t2) : null;
+        const h2 = (typeof e.h2 !== 'undefined') ? Number(e.h2) : null;
+        const dht1_ok = (typeof e.dht1_ok !== 'undefined') ? (e.dht1_ok ? 1 : 0) : null;
+        const dht2_ok = (typeof e.dht2_ok !== 'undefined') ? (e.dht2_ok ? 1 : 0) : null;
+        const hasSensor = [t1, h1, t2, h2].some(v => v !== null && Number.isFinite(v));
+        if (!hasSensor) continue;
+        enqueueTelemetry([now, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+      }
+    }
+    return res.json({ ok: true, received: entries.length });
+  } catch (err) {
+    console.error('Batch telemetry handler error', err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
 // Schedule endpoints: accept array of events {ts, relay, duration}
 app.post('/api/schedule', (req, res) => {
   // If SUPABASE_FUNCTIONS_BASE is configured, proxy the request to Supabase Edge Function

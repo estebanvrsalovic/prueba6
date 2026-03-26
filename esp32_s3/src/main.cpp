@@ -16,19 +16,34 @@
 const char *AP_SSID = "ESP32-AP";
 const char *AP_PASS = "esp32pass";
 
+// AP fallback timeout: disable AP after this many ms with no connected clients
+const unsigned long AP_TIMEOUT_MS = 4UL * 60UL * 1000UL; // 4 minutes
+static unsigned long apStartMillis = 0;
+static bool apActive = false;
+// Periodic AP window (enable temporary AP periodically to allow local access)
+const unsigned long AP_WINDOW_INTERVAL_MS = 10UL * 60UL * 1000UL; // every 10 minutes
+const unsigned long AP_WINDOW_DURATION_MS = 60UL * 1000UL; // 1 minute
+static unsigned long apWindowNextMillis = 0;
+static unsigned long apWindowEndMillis = 0;
+// WiFi reconnect backoff state
+static unsigned long nextWifiAttemptMillis = 0;
+static int wifiRetryCount = 0;
+const unsigned long WIFI_BACKOFF_BASE_MS = 5000UL; // base 5s
+const unsigned long WIFI_BACKOFF_MAX_MS = 10UL * 60UL * 1000UL; // cap 10m
 // Device identifier used in MQTT topics
 const char *DEVICE_ID = "esp32s3-01";
 
 // MQTT broker defaults (can be overridden by defining MQTT_BROKER_HOST/PORT in secrets.h)
+// MQTT broker host/port (use macros from secrets.h if provided)
 #ifndef MQTT_BROKER_HOST
-const char *MQTT_BROKER_HOST = "test.mosquitto.org";
+const char *mqtt_broker_host = "test.mosquitto.org";
 #else
-const char *MQTT_BROKER_HOST = MQTT_BROKER_HOST;
+const char *mqtt_broker_host = MQTT_BROKER_HOST;
 #endif
 #ifndef MQTT_BROKER_PORT
-const int MQTT_BROKER_PORT = 1883;
+const int mqtt_broker_port = 1883;
 #else
-const int MQTT_BROKER_PORT = MQTT_BROKER_PORT;
+const int mqtt_broker_port = MQTT_BROKER_PORT;
 #endif
 
 WiFiClient espWifiClient;
@@ -145,8 +160,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // Connect to MQTT broker and subscribe to file request topic
 void mqttConnectAndSubscribe() {
   if (mqttClient.connected()) return;
-  Serial.printf("Connecting to MQTT %s:%d\n", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
-  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  Serial.printf("Connecting to MQTT %s:%d\n", mqtt_broker_host, mqtt_broker_port);
+  mqttClient.setServer(mqtt_broker_host, mqtt_broker_port);
   mqttClient.setCallback(mqttCallback);
   int attempts = 0;
   while (!mqttClient.connected() && attempts < 5) {
@@ -190,64 +205,90 @@ int flushQueue() {
   if (!LittleFS.exists(QUEUE_PATH)) return 0;
   File f = LittleFS.open(QUEUE_PATH, FILE_READ);
   if (!f) return 0;
-
-  std::vector<String> remaining;
+  // Read all lines, compact (remove empty), dedupe (preserve order),
+  // then send as a single JSON array payload to the server.
+  std::vector<String> lines;
   while (f.available()) {
     String line = f.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
-    bool ok = false;
-    // try to send with limited retries
-    int attempts = 0;
-    while (attempts < MAX_RETRY_ATTEMPTS) {
-      if (line.length() == 0) break;
-      WiFiClientSecure client;
-      if (strlen(TELEMETRY_CA) > 10) {
-        client.setCACert(TELEMETRY_CA);
-      } else {
-        client.setInsecure();
-      }
-      HTTPClient https;
-      if (!https.begin(client, TELEMETRY_URL)) {
-        Serial.println("Failed to begin HTTP for queued item");
-        attempts++;
-      } else {
-        https.addHeader("Content-Type", "application/json");
-        https.addHeader("x-telemetry-key", TELEMETRY_KEY);
-        int code = https.POST(line);
-        String resp = https.getString();
-        Serial.printf("Queued POST -> HTTP %d\n", code);
-        if (code >= 200 && code < 300) {
-          ok = true;
-          https.end();
-          break;
-        } else {
-          attempts++;
-          https.end();
-          long backoff = (1 << attempts) * 1000;
-          delay(backoff);
-        }
-      }
-    }
-    if (!ok) remaining.push_back(line);
+    // keep original formatting of line (expected to be JSON)
+    lines.push_back(line);
   }
   f.close();
 
-  // rewrite queue with remaining
-  if (remaining.empty()) {
+  if (lines.empty()) {
     LittleFS.remove(QUEUE_PATH);
     return 0;
   }
+
+  // dedupe preserving order
+  std::vector<String> unique;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const String &ln = lines[i];
+    bool seen = false;
+    for (size_t j = 0; j < unique.size(); ++j) {
+      if (unique[j] == ln) { seen = true; break; }
+    }
+    if (!seen) unique.push_back(ln);
+  }
+
+  if (unique.empty()) {
+    LittleFS.remove(QUEUE_PATH);
+    return 0;
+  }
+
+  // build JSON array payload
+  String payload = "[";
+  for (size_t i = 0; i < unique.size(); ++i) {
+    payload += unique[i];
+    if (i + 1 < unique.size()) payload += ",";
+  }
+  payload += "]";
+
+  bool ok = false;
+  int attempts = 0;
+  while (attempts < MAX_RETRY_ATTEMPTS) {
+    WiFiClientSecure client;
+    if (strlen(TELEMETRY_CA) > 10) client.setCACert(TELEMETRY_CA);
+    else client.setInsecure();
+    HTTPClient https;
+    if (!https.begin(client, TELEMETRY_URL)) {
+      Serial.println("Failed to begin HTTP for queued batch");
+      attempts++;
+    } else {
+      https.addHeader("Content-Type", "application/json");
+      https.addHeader("x-telemetry-key", TELEMETRY_KEY);
+      int code = https.POST(payload);
+      String resp = https.getString();
+      Serial.printf("Queued batch POST -> HTTP %d\n", code);
+      if (code >= 200 && code < 300) {
+        ok = true;
+        https.end();
+        break;
+      } else {
+        attempts++;
+        https.end();
+        long backoff = (1 << attempts) * 1000;
+        delay(backoff);
+      }
+    }
+  }
+
+  if (ok) {
+    LittleFS.remove(QUEUE_PATH);
+    return 0;
+  }
+
+  // if failed, rewrite compacted queue (unique) back to file to save flash and avoid duplicates
   File out = LittleFS.open(QUEUE_PATH, FILE_WRITE);
   if (!out) {
     Serial.println("Failed to rewrite queue file");
-    return remaining.size();
+    return unique.size();
   }
-  for (auto &it : remaining) {
-    out.println(it);
-  }
+  for (auto &it : unique) out.println(it);
   out.close();
-  return remaining.size();
+  return unique.size();
 }
 
 // Count queued items without modifying the queue
@@ -265,12 +306,15 @@ int getQueueCount() {
   return count;
 }
 
-void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  Serial.print("Connecting to WiFi");
+// Attempt to connect to WiFi once (non-blocking caller should schedule retries)
+// Returns true if connected after this attempt.
+bool connectWifi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  Serial.print("Connecting to WiFi (attempt)");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
+  // short bounded wait to give the stack a chance
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
     delay(250);
     Serial.print('.');
   }
@@ -278,9 +322,10 @@ void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connect failed");
+    return true;
   }
+  Serial.println("WiFi connect attempt failed");
+  return false;
 }
 
 void sendTelemetry() {
@@ -340,8 +385,10 @@ void sendTelemetry() {
   payload += ",\"h1\":" + String(last_h1, 2);
   payload += ",\"t2\":" + String(last_t2, 2);
   payload += ",\"h2\":" + String(last_h2, 2);
-  payload += ",\"dht1_ok\":" + (dht1_ok ? "true" : "false");
-  payload += ",\"dht2_ok\":" + (dht2_ok ? "true" : "false");
+  payload += ",\"dht1_ok\":";
+  payload += (dht1_ok ? "true" : "false");
+  payload += ",\"dht2_ok\":";
+  payload += (dht2_ok ? "true" : "false");
   payload += "}";
   // Publish immediately to MQTT relay so server UI can receive telemetry even
   // if HTTP delivery is delayed. MQTT publish is best-effort here.
@@ -390,6 +437,9 @@ void setup() {
     if (ok) {
       Serial.print("AP started, IP: ");
       Serial.println(WiFi.softAPIP());
+      // mark AP active and start timeout countdown
+      apActive = true;
+      apStartMillis = millis();
     } else {
       Serial.println("Failed to start AP");
     }
@@ -417,7 +467,7 @@ void setup() {
   };
 
   // Serve status but require auth
-  server.on("/status", HTTP_GET, [](){
+  server.on("/status", HTTP_GET, [&](){
     if (requiresAuth()) return;
     String body = "{";
     body += "\"wifi\":\"";
@@ -461,11 +511,24 @@ void setup() {
 }
 
 void loop() {
+  // WiFi reconnect with exponential backoff
   if (WiFi.status() != WL_CONNECTED) {
-    connectWifi();
+    if (millis() >= nextWifiAttemptMillis) {
+      bool ok = connectWifi();
+      if (ok) {
+        wifiRetryCount = 0;
+        nextWifiAttemptMillis = 0;
+      } else {
+        wifiRetryCount++;
+        unsigned long backoff = WIFI_BACKOFF_BASE_MS * (1UL << min(wifiRetryCount, 10));
+        if (backoff > WIFI_BACKOFF_MAX_MS) backoff = WIFI_BACKOFF_MAX_MS;
+        nextWifiAttemptMillis = millis() + backoff;
+        Serial.printf("Scheduling next WiFi attempt in %lu ms\n", backoff);
+      }
+    }
   }
 
-  // ensure MQTT connected
+  // ensure MQTT connected when on network
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) mqttConnectAndSubscribe();
     mqttClient.loop();
@@ -478,5 +541,52 @@ void loop() {
 
   // handle incoming HTTP requests to the status endpoint
   server.handleClient();
+
+  // AP periodic window: enable a temporary AP if device offline
+  if (!apActive && WiFi.status() != WL_CONNECTED) {
+    if (apWindowNextMillis == 0) apWindowNextMillis = millis() + AP_WINDOW_INTERVAL_MS;
+    else if (millis() >= apWindowNextMillis) {
+      Serial.println("Enabling periodic AP window for local access");
+      bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+      if (ok) {
+        apActive = true;
+        apStartMillis = 0; // reset client activity timer
+        apWindowEndMillis = millis() + AP_WINDOW_DURATION_MS;
+      } else {
+        Serial.println("Failed to start AP for window");
+        apWindowNextMillis = millis() + AP_WINDOW_INTERVAL_MS;
+      }
+    }
+  }
+
+  // AP timeout: disable AP after AP_TIMEOUT_MS if no clients connected
+  if (apActive) {
+    int clients = WiFi.softAPgetStationNum();
+    if (clients > 0) {
+      // client present — cancel countdown
+      apStartMillis = 0;
+    } else {
+      // no client connected; start countdown if not already started
+      if (apStartMillis == 0) apStartMillis = millis();
+      else if (millis() - apStartMillis >= AP_TIMEOUT_MS) {
+        Serial.println("AP timeout reached with no clients; disabling AP");
+        WiFi.softAPdisconnect(true);
+        apActive = false;
+        apStartMillis = 0;
+        // schedule next window
+        apWindowNextMillis = millis() + AP_WINDOW_INTERVAL_MS;
+        apWindowEndMillis = 0;
+      }
+    }
+    // also disable if the periodic window ended
+    if (apWindowEndMillis != 0 && millis() >= apWindowEndMillis) {
+      Serial.println("Periodic AP window ended; disabling AP");
+      WiFi.softAPdisconnect(true);
+      apActive = false;
+      apWindowEndMillis = 0;
+      apWindowNextMillis = millis() + AP_WINDOW_INTERVAL_MS;
+    }
+  }
+
   delay(100);
 }
