@@ -1,10 +1,14 @@
-const socket = io();
+const socket = window.socket || (window.socket = io());
 
 const telemetryEl = document.getElementById('telemetry');
 const rawEl = document.getElementById('raw');
 const relaysEl = document.getElementById('relays');
 const connStatusEl = document.getElementById('conn-status');
 const controlsEl = document.getElementById('controls');
+const valT1 = document.getElementById('val-t1');
+const valH1 = document.getElementById('val-h1');
+const valT2 = document.getElementById('val-t2');
+const valH2 = document.getElementById('val-h2');
 
 const ctxT1 = document.getElementById('chart-t1').getContext('2d');
 const ctxH1 = document.getElementById('chart-h1').getContext('2d');
@@ -13,12 +17,108 @@ const ctxH2 = document.getElementById('chart-h2').getContext('2d');
 
 let relayStates = {};
 const MAX_HISTORY = 100;
+// Raw MQTT messages buffer (show latest N lines)
+const RAW_MAX = 200;
+const rawMessages = [];
+function pushRaw(line) {
+  try {
+    rawMessages.unshift(line);
+    if (rawMessages.length > RAW_MAX) rawMessages.length = RAW_MAX;
+    rawEl.textContent = rawMessages.join('\n');
+  } catch (e) { console.error('pushRaw failed', e); }
+}
+
+// Try to enable Supabase Realtime if the server provides anon config at runtime
+async function initSupabaseRealtime() {
+  try {
+    const r = await fetch('/api/supabase-config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    if (!cfg.SUPABASE_URL || !cfg.SUPABASE_ANON_KEY) return;
+    // load UMD build of supabase-js dynamically
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/dist/umd/supabase.min.js';
+      s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+    });
+    if (!window.supabase || !window.supabase.createClient) return;
+    const { createClient } = window.supabase;
+    const supabase = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+    // initial load: latest 50
+    const { data: rows } = await supabase.from('telemetry').select('*').order('ts', { ascending: false }).limit(50);
+      if (Array.isArray(rows)) {
+        rows.reverse().forEach(it => {
+          const ts = new Date(it.ts).toISOString();
+          if (it.t1 !== null) pushPoint(chartT1, ts, Number(it.t1));
+          if (it.h1 !== null) pushPoint(chartH1, ts, Number(it.h1));
+          if (it.t2 !== null) pushPoint(chartT2, ts, Number(it.t2));
+          if (it.h2 !== null) pushPoint(chartH2, ts, Number(it.h2));
+        });
+      }
+    // subscribe to new inserts
+    supabase.channel('realtime-telemetry')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'telemetry' }, payload => {
+        const row = payload.new;
+        const ts = new Date(row.ts).toISOString();
+        if (row.t1 !== null) { pushPoint(chartT1, ts, Number(row.t1)); valT1.textContent = Number(row.t1).toFixed(2) + ' °C'; }
+        if (row.h1 !== null) { pushPoint(chartH1, ts, Number(row.h1)); valH1.textContent = Number(row.h1).toFixed(2) + ' %'; }
+        if (row.t2 !== null) { pushPoint(chartT2, ts, Number(row.t2)); valT2.textContent = Number(row.t2).toFixed(2) + ' °C'; }
+        if (row.h2 !== null) { pushPoint(chartH2, ts, Number(row.h2)); valH2.textContent = Number(row.h2).toFixed(2) + ' %'; }
+      })
+      .subscribe();
+  } catch (err) {
+    console.debug('Supabase realtime not available', err);
+  }
+}
+
+// attempt to initialize Supabase realtime; non-blocking
+initSupabaseRealtime();
 
 function makeChart(ctx, label, color) {
   return new Chart(ctx, {
     type: 'line',
     data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: 'rgba(0,0,0,0)', tension: 0.15, pointRadius: 2, borderWidth: 2 }] },
-    options: { scales: { x: { display: true }, y: { display: true } }, plugins: { legend: { display: false } }, responsive: true, maintainAspectRatio: false }
+    options: {
+      scales: {
+        x: {
+          display: true,
+          ticks: {
+            callback: function(value, index) {
+              try {
+                const labels = this.chart.data.labels || [];
+                const label = labels[index];
+                return label ? new Date(label).toLocaleTimeString() : value;
+              } catch (e) { return value; }
+            }
+          }
+        },
+        y: { display: true }
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          position: 'nearest',
+          yAlign: 'bottom',
+          caretSize: 0,
+          caretPadding: 8,
+          padding: 8,
+          bodyFont: { size: 36 }, // 300% larger than default (~12)
+          titleFont: { size: 12 },
+          callbacks: {
+            // title shows full date+time
+            title: function(items) {
+              if (!items || items.length === 0) return '';
+              const label = items[0].label;
+              try { return new Date(label).toLocaleString(); } catch (e) { return label; }
+            },
+            // body shows only the numeric value (rendered large by bodyFont)
+            label: function(ctx) { return ctx.formattedValue; }
+          }
+        }
+      },
+      responsive: true,
+      maintainAspectRatio: false
+    }
   });
 }
 
@@ -49,9 +149,14 @@ for (let i=1;i<=6;i++) {
 socket.on('telemetry', (data) => {
   lastTelemetry = data;
   telemetryEl.textContent = JSON.stringify(data, null, 2);
-  rawEl.textContent = `telemetry: ${JSON.stringify(data)}` + '\n' + rawEl.textContent;
+  // update human-readable latest values
+  if (data && typeof data.t1 !== 'undefined') valT1.textContent = Number(data.t1).toFixed(2) + ' °C';
+  if (data && typeof data.h1 !== 'undefined') valH1.textContent = Number(data.h1).toFixed(2) + ' %';
+  if (data && typeof data.t2 !== 'undefined') valT2.textContent = Number(data.t2).toFixed(2) + ' °C';
+  if (data && typeof data.h2 !== 'undefined') valH2.textContent = Number(data.h2).toFixed(2) + ' %';
+  pushRaw(`telemetry: ${JSON.stringify(data)}`);
   // update charts for each sensor field if present
-  const ts = new Date().toLocaleTimeString();
+  const ts = new Date().toISOString();
   if (data && typeof data.t1 !== 'undefined') {
     pushPoint(chartT1, ts, Number(data.t1));
   }
@@ -73,17 +178,17 @@ socket.on('relay-state', (obj) => {
   const state = String(obj.state);
   relayStates[String(relay)] = state;
   updateRelays();
-  rawEl.textContent = `state ${relay}: ${state}` + '\n' + rawEl.textContent;
+  pushRaw(`state ${relay}: ${state}`);
 });
 
 socket.on('mqtt', (m) => {
-  rawEl.textContent = `${m.topic}: ${m.payload}` + '\n' + rawEl.textContent;
+  pushRaw(`${m.topic}: ${m.payload}`);
 });
 
 socket.on('connect', () => { connStatusEl.textContent = 'connected'; connStatusEl.style.color = 'green'; });
 socket.on('disconnect', () => { connStatusEl.textContent = 'disconnected'; connStatusEl.style.color = 'red'; });
-socket.on('command-ack', (a) => { rawEl.textContent = `command ack relay${a.relay}=${a.value}` + '\n' + rawEl.textContent; relayStates[String(a.relay)] = String(a.value); updateRelays(); });
-socket.on('command-error', (e) => { rawEl.textContent = `command error ${e.error}` + '\n' + rawEl.textContent; });
+socket.on('command-ack', (a) => { pushRaw(`command ack relay${a.relay}=${a.value}`); relayStates[String(a.relay)] = String(a.value); updateRelays(); });
+socket.on('command-error', (e) => { pushRaw(`command error ${e.error}`); });
 
 function updateRelays() {
   relaysEl.innerHTML = '';
@@ -125,13 +230,76 @@ function pushPoint(chart, label, value) {
 fetch('/history?n=100').then(r => r.json()).then(arr => {
   if (!Array.isArray(arr)) return;
   arr.forEach(it => {
-    const ts = new Date(it.ts).toLocaleTimeString();
+    const ts = new Date(it.ts).toISOString();
     if (typeof it.t1 !== 'undefined' && it.t1 !== null) pushPoint(chartT1, ts, Number(it.t1));
     if (typeof it.h1 !== 'undefined' && it.h1 !== null) pushPoint(chartH1, ts, Number(it.h1));
     if (typeof it.t2 !== 'undefined' && it.t2 !== null) pushPoint(chartT2, ts, Number(it.t2));
     if (typeof it.h2 !== 'undefined' && it.h2 !== null) pushPoint(chartH2, ts, Number(it.h2));
   });
 }).catch(e=>{});
+
+// Historical measurements UI
+const btnLoadHistory = document.getElementById('btn-load-history');
+const btnClearHistory = document.getElementById('btn-clear-history');
+const histNEl = document.getElementById('hist-n');
+const historyTableBody = document.querySelector('#history-table tbody');
+
+async function loadHistory(n) {
+  try {
+    const r = await fetch(`/history?n=${encodeURIComponent(n)}`);
+    if (!r.ok) { console.error('Failed to fetch history', r.status); return; }
+    const arr = await r.json();
+    historyTableBody.innerHTML = '';
+    arr.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.style.borderTop = '1px solid rgba(255,255,255,0.04)';
+      const ts = new Date(row.ts).toLocaleString();
+      const tdTs = document.createElement('td'); tdTs.textContent = ts; tdTs.style.padding = '6px';
+      const tdT1 = document.createElement('td'); tdT1.textContent = row.t1 !== null ? Number(row.t1).toFixed(2) : '';
+      const tdH1 = document.createElement('td'); tdH1.textContent = row.h1 !== null ? Number(row.h1).toFixed(2) : '';
+      const tdT2 = document.createElement('td'); tdT2.textContent = row.t2 !== null ? Number(row.t2).toFixed(2) : '';
+      const tdH2 = document.createElement('td'); tdH2.textContent = row.h2 !== null ? Number(row.h2).toFixed(2) : '';
+      [tdTs, tdT1, tdH1, tdT2, tdH2].forEach(td => { td.style.padding = '6px'; td.style.fontFamily = 'ui-monospace,monospace'; });
+      tr.appendChild(tdTs); tr.appendChild(tdT1); tr.appendChild(tdH1); tr.appendChild(tdT2); tr.appendChild(tdH2);
+      historyTableBody.appendChild(tr);
+    });
+  } catch (e) {
+    console.error('loadHistory error', e);
+  }
+}
+
+btnLoadHistory && btnLoadHistory.addEventListener('click', () => {
+  const n = Number(histNEl.value) || 50; loadHistory(n);
+});
+btnClearHistory && btnClearHistory.addEventListener('click', () => { historyTableBody.innerHTML = ''; });
+
+// Send a small test telemetry POST to `/api/telemetry` for end-to-end validation
+const btnSendTest = document.getElementById('btn-send-test-telemetry');
+if (btnSendTest) btnSendTest.addEventListener('click', async () => {
+  try {
+    const sample = {
+      ts: new Date().toISOString(),
+      t1: (20 + Math.random()*5).toFixed(2),
+      h1: (40 + Math.random()*10).toFixed(2),
+      t2: (19 + Math.random()*4).toFixed(2),
+      h2: (45 + Math.random()*8).toFixed(2)
+    };
+    pushRaw('Posting test telemetry -> /api/telemetry');
+    const r = await fetch('/api/telemetry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sample) });
+    if (!r.ok) {
+      pushRaw('Test telemetry failed: ' + r.status + ' ' + r.statusText);
+      alert('Test telemetry POST failed: ' + r.status + ' ' + r.statusText);
+      return;
+    }
+    pushRaw('Test telemetry posted (server accepted)');
+    alert('Test telemetry posted');
+  } catch (err) {
+    console.error('Test telemetry error', err); pushRaw('Test telemetry error: ' + String(err)); alert('Test telemetry error: ' + String(err));
+  }
+});
+
+// expose small helper for initial load if desired
+window.loadHistory = loadHistory;
 
 // --- Plans UI (localStorage-backed) ---------------------------------------------------------
 const plansListEl = document.getElementById('plans-list');

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>prueba6 — Deploy en Railway</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;color:#111}
+    h1{margin-bottom:6px}
+    pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto}
+    .card{border:1px solid #e1e4e8;padding:16px;border-radius:8px;margin:12px 0}
+    a.button{display:inline-block;padding:10px 14px;background:#8250df;color:#fff;border-radius:6px;text-decoration:none}
+  </style>
+</head>
+<body>
+  <h1>prueba6 — Despliegue en Railway</h1>
+  <p>Esta página incluye los pasos mínimos para desplegar el backend Node.js en Railway y configurar la base de datos Postgres.</p>
+
+  <div class="card">
+    <strong>Paso 1 — Conectar tu repositorio</strong>
+    <p>En Railway, crea un nuevo proyecto y elige <em>Deploy from GitHub</em>. Conecta el repositorio <code>estebanvrsalovic/prueba6</code> y selecciona la rama <code>fix/schedule-parsing</code>.</p>
+    <p><a class="button" href="https://railway.app/new" target="_blank" rel="noopener">Abrir Railway</a></p>
+  </div>
+
+  <div class="card">
+    <strong>Paso 2 — Variables de entorno</strong>
+    <p>Añade las siguientes variables en Railway → Settings → Environment Variables:</p>
+    <pre>
+DATABASE_URL=postgres://usuario:pass@host:5432/dbname
+MQTT_BROKER=mqtt://broker:1883
+SUPABASE_FUNCTIONS_BASE=https://xxxx.functions.supabase.co
+SERVICE_ROLE_KEY=eyJhbGciOiJI...
+    </pre>
+    <p>Si pones <code>DATABASE_URL</code>, el servidor usará Postgres. Si no, usará SQLite local en el contenedor.</p>
+  </div>
+
+  <div class="card">
+    <strong>Paso 3 — Comando de arranque</strong>
+    <p>Usa este comando para iniciar el servidor (desde la raíz del repo):</p>
+    <pre>node web/server.js</pre>
+  </div>
+
+  <div class="card">
+    <strong>Endpoints útiles</strong>
+    <ul>
+      <li><code>/api/schedule</code> — GET/POST para gestionar horarios</li>
+      <li><code>/history?n=5</code> — obtener últimas lecturas</li>
+      <li><code>/esp32s3/schedule</code> — MQTT topic para publicar horarios</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <strong>Notas</strong>
+    <ul>
+      <li>Railway crea un contenedor para el servicio; asegúrate de asignar un plan si necesitas recursos persistentes.</li>
+      <li>Si quieres, puedo crear la plantilla de despliegue y añadir un botón en el README.</li>
+    </ul>
+  </div>
+
+</body>
+</html>

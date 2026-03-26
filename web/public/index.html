@@ -44,6 +44,24 @@
   <div style="margin-bottom:8px">Status: <strong id="conn-status">connecting...</strong></div>
   <div class="box">
     <h4>Last telemetry</h4>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="min-width:120px">
+        <div style="font-size:12px;color:var(--muted)">Sensor1 T</div>
+        <div id="val-t1" style="font-family:ui-monospace,monospace;font-size:18px">—</div>
+      </div>
+      <div style="min-width:120px">
+        <div style="font-size:12px;color:var(--muted)">Sensor1 H</div>
+        <div id="val-h1" style="font-family:ui-monospace,monospace;font-size:18px">—</div>
+      </div>
+      <div style="min-width:120px">
+        <div style="font-size:12px;color:var(--muted)">Sensor2 T</div>
+        <div id="val-t2" style="font-family:ui-monospace,monospace;font-size:18px">—</div>
+      </div>
+      <div style="min-width:120px">
+        <div style="font-size:12px;color:var(--muted)">Sensor2 H</div>
+        <div id="val-h2" style="font-family:ui-monospace,monospace;font-size:18px">—</div>
+      </div>
+    </div>
     <pre id="telemetry">(no data yet)</pre>
   </div>
   <div class="box">
@@ -111,6 +129,25 @@
   <div class="box">
     <h4>Raw MQTT messages</h4>
     <pre id="raw">(no messages yet)</pre>
+  </div>
+  <div class="box" id="history-box">
+    <h4>Mediciones históricas</h4>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label>Mostrar últimas <input id="hist-n" type="number" value="50" min="1" max="1000" style="width:80px;margin-left:6px"> entradas</label>
+      <button id="btn-load-history" class="btn">Cargar</button>
+      <button id="btn-clear-history" class="btn ghost">Limpiar tabla</button>
+      <button id="btn-send-test-telemetry" class="btn ghost" style="margin-left:8px">Enviar telemetría de prueba</button>
+    </div>
+    <div style="margin-top:8px;overflow:auto;max-height:320px">
+      <table id="history-table" style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="text-align:left;color:var(--muted);font-size:13px">
+            <th>Fecha</th><th>t1 (°C)</th><th>h1 (%)</th><th>t2 (°C)</th><th>h2 (%)</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
   <script src="https://cdn.socket.io/4.7.1/socket.io.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>

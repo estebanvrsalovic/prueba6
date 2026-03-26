@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Web Server</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 1rem; }
+    pre { background:#f4f4f4; padding:1rem; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Web Server</h1>
+  <button id="refresh">Actualizar estado</button>
+  <pre id="status">Cargando...</pre>
+  <script>
+    async function loadStatus(){
+      try{
+        const res = await fetch('/status');
+        const j = await res.json();
+        document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+      }catch(e){
+        document.getElementById('status').textContent = 'Error: '+e;
+      }
+    }
+    document.getElementById('refresh').onclick = loadStatus;
+    loadStatus();
+  </script>
+</body>
+</html>

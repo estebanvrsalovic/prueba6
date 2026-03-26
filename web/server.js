@@ -5,6 +5,11 @@ const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
+
+const DATABASE_URL = process.env.DATABASE_URL || '';
+let usingPg = false;
+let pgPool = null;
 
 const app = express();
 const server = http.createServer(app);
@@ -16,77 +21,367 @@ const io = new Server(server, {
 });
 // store last-known relay states so new web clients can be initialized
 const lastRelayStates = {};
+// pending file responses map: key = `${deviceId}:${reqId}` => { resolve, timer }
+const pendingFileResponses = {};
+
+// Normalize human-friendly states to device values for publishing
+function normalizeStateForDevice(val) {
+  if (val === null || val === undefined) return '';
+  const s = String(val).trim();
+  if (s === '') return s;
+  const lower = s.toLowerCase();
+  if (lower === 'on' || lower === 'true') return '1';
+  if (lower === 'off' || lower === 'false') return '0';
+  // numeric strings (1,0, etc.) pass through
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(s)) return s;
+  return s;
+}
 
 // Config via env
 const MQTT_BROKER = process.env.MQTT_BROKER || 'mqtt://test.mosquitto.org:1883';
 const MQTT_TELEMETRY_TOPIC = process.env.MQTT_TELEMETRY_TOPIC || 'esp32s3/telemetry';
 const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'esp32s3/state/#';
+const MQTT_FILE_RESPONSE_TOPIC = 'esp32s3/file/response/#';
 // When set, forward frontend API calls to Supabase Edge Functions base URL
 // Example: https://xyz.supabase.co/functions/v1
 const SUPABASE_FUNCTIONS_BASE = process.env.SUPABASE_FUNCTIONS_BASE || '';
+const DEVICE_API_KEY = process.env.DEVICE_API_KEY || '';
 
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
+
+// Expose supabase client config to the frontend if set (otherwise return empty values)
+app.get('/api/supabase-config', (req, res) => {
+  return res.json({
+    SUPABASE_URL: process.env.SUPABASE_URL || '',
+    SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || ''
+  });
+});
 
 // ensure data directory exists
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// SQLite DB
-const DB_FILE = path.join(DATA_DIR, 'telemetry.db');
-const db = new sqlite3.Database(DB_FILE);
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS telemetry (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER,
-    device_ts INTEGER,
-    t1 REAL,
-    h1 REAL,
-    t2 REAL,
-    h2 REAL
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS schedules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_ts INTEGER,
-    relay INTEGER,
-    duration INTEGER,
-    repeat8 INTEGER DEFAULT 0,
-    created_ts INTEGER
-  )`);
-  // Ensure legacy DBs have the device_ts column
-  db.all(`PRAGMA table_info(telemetry)`, (err, rows) => {
-    if (err) {
-      console.error('PRAGMA table_info error', err);
-      return;
+// Database initialization: Postgres via DATABASE_URL (Supabase) OR SQLite fallback
+if (DATABASE_URL) {
+  usingPg = true;
+  pgPool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  (async () => {
+    try {
+      // Create tables if they don't exist
+      await pgPool.query(`CREATE TABLE IF NOT EXISTS telemetry (
+        id SERIAL PRIMARY KEY,
+        ts BIGINT,
+        device_ts BIGINT,
+        t1 REAL,
+        h1 REAL,
+        t2 REAL,
+        h2 REAL,
+        dht1_ok INTEGER,
+        dht2_ok INTEGER
+      )`);
+      const DEVICE_API_KEY = process.env.DEVICE_API_KEY || '';
+
+      await pgPool.query(`CREATE TABLE IF NOT EXISTS schedules (
+        id SERIAL PRIMARY KEY,
+        event_ts BIGINT,
+        relay INTEGER,
+        duration INTEGER,
+        repeat8 INTEGER DEFAULT 0,
+        created_ts BIGINT
+      )`);
+      // ensure relay_states exists in Postgres as well (parity with SQLite)
+      await pgPool.query(`CREATE TABLE IF NOT EXISTS relay_states (
+        id SERIAL PRIMARY KEY,
+        relay INTEGER NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        updated_ts BIGINT
+      )`);
+      console.log('Connected to Postgres and ensured tables exist');
+    } catch (e) {
+      console.error('Failed to prepare Postgres schema', e);
     }
-    const hasDeviceTs = rows && rows.some(r => r.name === 'device_ts');
-    if (!hasDeviceTs) {
-      console.log('Altering telemetry table to add device_ts column');
-      db.run('ALTER TABLE telemetry ADD COLUMN device_ts INTEGER', (e) => { if (e) console.error('Failed to add device_ts column', e); });
-    }
+  })();
+} else {
+  // SQLite DB
+  const DB_FILE = path.join(DATA_DIR, 'telemetry.db');
+  var db = new sqlite3.Database(DB_FILE);
+  db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS telemetry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER,
+      device_ts INTEGER,
+      t1 REAL,
+      h1 REAL,
+      t2 REAL,
+      h2 REAL,
+      dht1_ok INTEGER,
+      dht2_ok INTEGER
+    )`);
+    db.run(`CREATE TABLE IF NOT EXISTS schedules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_ts INTEGER,
+      relay INTEGER,
+      duration INTEGER,
+      repeat8 INTEGER DEFAULT 0,
+      created_ts INTEGER
+    )`);
+    // Persist relay states for SQLite fallback
+    db.run(`CREATE TABLE IF NOT EXISTS relay_states (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      relay INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      updated_ts INTEGER
+    )`);
+    // Ensure legacy DBs have the device_ts column
+    db.all(`PRAGMA table_info(telemetry)`, (err, rows) => {
+      if (err) {
+        console.error('PRAGMA table_info error', err);
+        return;
+      }
+      const hasDeviceTs = rows && rows.some(r => r.name === 'device_ts');
+      if (!hasDeviceTs) {
+        console.log('Altering telemetry table to add device_ts column');
+        db.run('ALTER TABLE telemetry ADD COLUMN device_ts INTEGER', (e) => { if (e) console.error('Failed to add device_ts column', e); });
+      }
+      const hasDht1 = rows && rows.some(r => r.name === 'dht1_ok');
+      if (!hasDht1) {
+        console.log('Altering telemetry table to add dht1_ok column');
+        db.run('ALTER TABLE telemetry ADD COLUMN dht1_ok INTEGER', (e) => { if (e) console.error('Failed to add dht1_ok column', e); });
+      }
+      const hasDht2 = rows && rows.some(r => r.name === 'dht2_ok');
+      if (!hasDht2) {
+        console.log('Altering telemetry table to add dht2_ok column');
+        db.run('ALTER TABLE telemetry ADD COLUMN dht2_ok INTEGER', (e) => { if (e) console.error('Failed to add dht2_ok column', e); });
+      }
+    });
+    // Ensure schedules table has repeat8 column for 8-day repeating schedules
+    db.all(`PRAGMA table_info(schedules)`, (err2, rows2) => {
+      if (err2) { console.error('PRAGMA table_info(schedules) error', err2); return; }
+      const hasRepeat8 = rows2 && rows2.some(r => r.name === 'repeat8');
+      if (!hasRepeat8) {
+        console.log('Altering schedules table to add repeat8 column');
+        db.run('ALTER TABLE schedules ADD COLUMN repeat8 INTEGER DEFAULT 0', (e) => { if (e) console.error('Failed to add repeat8 column', e); });
+      }
+    });
   });
-  // Ensure schedules table has repeat8 column for 8-day repeating schedules
-  db.all(`PRAGMA table_info(schedules)`, (err2, rows2) => {
-    if (err2) { console.error('PRAGMA table_info(schedules) error', err2); return; }
-    const hasRepeat8 = rows2 && rows2.some(r => r.name === 'repeat8');
-    if (!hasRepeat8) {
-      console.log('Altering schedules table to add repeat8 column');
-      db.run('ALTER TABLE schedules ADD COLUMN repeat8 INTEGER DEFAULT 0', (e) => { if (e) console.error('Failed to add repeat8 column', e); });
+
+// Helper: upsert a relay state into DB, update in-memory cache and emit to clients.
+// publishToDevice: when true (default) also sends an MQTT command to the device.
+async function upsertRelayState(relayId, publishVal, opts = { publishToDevice: true }) {
+  const updatedTs = Date.now();
+  lastRelayStates[String(relayId)] = publishVal;
+  io.emit('relay-state', { relay: String(relayId), state: publishVal });
+  if (usingPg) {
+    try {
+      const sel = await pgPool.query('SELECT id FROM relay_states WHERE relay=$1', [relayId]);
+      if (sel.rows.length > 0) {
+        await pgPool.query('UPDATE relay_states SET state=$1, updated_ts=$2 WHERE relay=$3', [publishVal, updatedTs, relayId]);
+      } else {
+        await pgPool.query('INSERT INTO relay_states (relay, state, updated_ts) VALUES ($1,$2,$3)', [relayId, publishVal, updatedTs]);
+      }
+    } catch (e) {
+      console.error('PG relay_states upsert error', e);
+      throw e;
     }
-  });
-});
+  } else {
+    // sqlite path uses callbacks; wrap in promise
+    await new Promise((resolve, reject) => {
+      db.get('SELECT id FROM relay_states WHERE relay=?', [relayId], (err, row) => {
+        if (err) return reject(err);
+        const finish = (e) => { if (e) return reject(e); resolve(); };
+        if (row) {
+          db.run('UPDATE relay_states SET state=?, updated_ts=? WHERE relay=?', [publishVal, updatedTs, relayId], finish);
+        } else {
+          db.run('INSERT INTO relay_states (relay, state, updated_ts) VALUES (?,?,?)', [relayId, publishVal, updatedTs], finish);
+        }
+      });
+    });
+  }
+  if (opts.publishToDevice) {
+    try {
+      const topic = `esp32s3/command/relay${relayId}`;
+      client.publish(topic, publishVal, { qos: 0 }, (err) => { if (err) console.error('MQTT publish error on relay_states upsert', err); else console.log('Published MQTT command', topic, publishVal); });
+    } catch (e) { console.error('Failed to publish MQTT command', e); }
+  }
+}
+
+  // Telemetry write queue to avoid SQLITE_BUSY when concurrent writes occur.
+  // We enqueue telemetry rows and process them serially.
+  const telemetryQueue = [];
+  let telemetryProcessing = false;
+
+  function processTelemetryQueue() {
+    if (telemetryProcessing) return;
+    const item = telemetryQueue.shift();
+    if (!item) return;
+    telemetryProcessing = true;
+    db.run('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2,dht1_ok,dht2_ok) VALUES (?,?,?,?,?,?,?,?)', item.params, function(err) {
+      if (err) {
+        console.error('SQLite telemetry insert error', err);
+        // if DB is busy or other transient error, retry with backoff by re-queueing
+        if (telemetryQueue.length < 1000) {
+          // push to front to retry soon
+          telemetryQueue.unshift(item);
+        } else {
+          console.error('Telemetry queue full, dropping item');
+        }
+        // small delay before next attempt
+        setTimeout(() => { telemetryProcessing = false; processTelemetryQueue(); }, 100);
+        return;
+      }
+      telemetryProcessing = false;
+      // schedule next immediately
+      setImmediate(processTelemetryQueue);
+    });
+  }
+
+  function enqueueTelemetry(params) {
+    telemetryQueue.push({ params });
+    // kick the processor
+    setImmediate(processTelemetryQueue);
+  }
+}
 
 // HTTP endpoint to fetch last N telemetry records from DB
 app.get('/history', (req, res) => {
   const n = parseInt(req.query.n || '50', 10);
-  db.all('SELECT ts, t1, h1, t2, h2 FROM telemetry ORDER BY ts DESC LIMIT ?', [n], (err, rows) => {
-    if (err) {
-      console.error('DB history error', err);
-      return res.json([]);
+  if (usingPg) {
+    (async () => {
+      try {
+        const r = await pgPool.query('SELECT ts, t1, h1, t2, h2, dht1_ok, dht2_ok FROM telemetry ORDER BY ts DESC LIMIT $1', [n]);
+        return res.json(r.rows.reverse());
+      } catch (e) {
+        console.error('PG history error', e);
+        return res.json([]);
+      }
+    })();
+  } else {
+    db.all('SELECT ts, t1, h1, t2, h2, dht1_ok, dht2_ok FROM telemetry ORDER BY ts DESC LIMIT ?', [n], (err, rows) => {
+      if (err) {
+        console.error('DB history error', err);
+        return res.json([]);
+      }
+      // return chronological order
+      res.json(rows.reverse());
+    });
+  }
+});
+
+// Request a file from a device over MQTT. Returns JSON with content_base64 and content_type.
+app.post('/api/device_file', async (req, res) => {
+  try {
+    const { device_id, path } = req.body;
+    if (!device_id || !path) return res.status(400).json({ error: 'device_id and path required' });
+    // optional API key protection: set DEVICE_API_KEY env var to enable
+    if (DEVICE_API_KEY) {
+      const provided = req.headers['x-api-key'] || req.get('x-api-key');
+      if (!provided || provided !== DEVICE_API_KEY) return res.status(401).json({ error: 'unauthorized' });
     }
-    // return chronological order
-    res.json(rows.reverse());
-  });
+    // basic validation to avoid abuse
+    if (!/^[A-Za-z0-9_-]+$/.test(device_id)) return res.status(400).json({ error: 'invalid device_id' });
+    if (typeof path !== 'string' || path.indexOf('..') !== -1) return res.status(400).json({ error: 'invalid path' });
+    const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+    const topicReq = `esp32s3/file/request/${device_id}`;
+    const payload = JSON.stringify({ path, req_id: reqId });
+    const key = `${device_id}:${reqId}`;
+    // publish request
+    client.publish(topicReq, payload, { qos: 0 }, (err) => {
+      if (err) console.error('Publish file request error', err);
+    });
+    // wait for response (with timeout)
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { delete pendingFileResponses[key]; reject(new Error('timeout')); }, 10000);
+      pendingFileResponses[key] = { resolve, timer };
+    });
+    return res.json(result);
+  } catch (e) {
+    console.error('POST /api/device_file error', e);
+    return res.status(500).json({ error: e.toString() });
+  }
+});
+
+// HTTP telemetry ingestion endpoint (accepts single object, array, or newline-delimited JSON)
+app.post('/api/telemetry', express.text({ type: '*/*' }), async (req, res) => {
+  const TELEMETRY_KEY = process.env.TELEMETRY_KEY || null;
+  if (TELEMETRY_KEY) {
+    const keyHeader = req.headers['x-telemetry-key'] || req.headers['x-api-key'] || req.headers['authorization'];
+    let key = null;
+    if (keyHeader) {
+      if (typeof keyHeader === 'string' && keyHeader.toLowerCase().startsWith('bearer ')) key = keyHeader.slice(7).trim();
+      else if (Array.isArray(keyHeader)) key = keyHeader[0];
+      else key = keyHeader;
+    }
+    if (!key || key !== TELEMETRY_KEY) return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  let raw = req.body || '';
+  // try to parse JSON body
+  const parseJson = (s) => { try { return JSON.parse(s); } catch (e) { return null; } };
+  let entries = [];
+  const parsed = parseJson(raw);
+  if (parsed && Array.isArray(parsed)) entries = parsed;
+  else if (parsed && typeof parsed === 'object') entries = [parsed];
+  else {
+    // try newline-delimited JSON
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    for (const ln of lines) {
+      const p = parseJson(ln);
+      if (p) entries.push(p);
+    }
+  }
+
+  if (entries.length === 0) return res.status(400).json({ error: 'no valid telemetry entries found' });
+
+  const now = Date.now();
+  // normalize and insert each entry
+  try {
+    if (usingPg) {
+      (async () => {
+        const clientPg = await pgPool.connect();
+        try {
+          await clientPg.query('BEGIN');
+          for (const e of entries) {
+            const device_ts = (typeof e.t !== 'undefined') ? Number(e.t) : null;
+            const t1 = (typeof e.t1 !== 'undefined') ? Number(e.t1) : null;
+            const h1 = (typeof e.h1 !== 'undefined') ? Number(e.h1) : null;
+            const t2 = (typeof e.t2 !== 'undefined') ? Number(e.t2) : null;
+            const h2 = (typeof e.h2 !== 'undefined') ? Number(e.h2) : null;
+            const dht1_ok = (typeof e.dht1_ok !== 'undefined') ? (e.dht1_ok ? 1 : 0) : null;
+            const dht2_ok = (typeof e.dht2_ok !== 'undefined') ? (e.dht2_ok ? 1 : 0) : null;
+            // skip entries without numeric sensors
+            const hasSensor = [t1, h1, t2, h2].some(v => v !== null && Number.isFinite(v));
+            if (!hasSensor) continue;
+            await clientPg.query('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2,dht1_ok,dht2_ok) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [now, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+          }
+          await clientPg.query('COMMIT');
+        } catch (e) {
+          await clientPg.query('ROLLBACK');
+          console.error('PG batch telemetry insert error', e);
+        } finally {
+          clientPg.release();
+        }
+      })();
+    } else {
+      // sqlite: enqueue each entry into serialized queue
+      for (const e of entries) {
+        const device_ts = (typeof e.t !== 'undefined') ? Number(e.t) : null;
+        const t1 = (typeof e.t1 !== 'undefined') ? Number(e.t1) : null;
+        const h1 = (typeof e.h1 !== 'undefined') ? Number(e.h1) : null;
+        const t2 = (typeof e.t2 !== 'undefined') ? Number(e.t2) : null;
+        const h2 = (typeof e.h2 !== 'undefined') ? Number(e.h2) : null;
+        const dht1_ok = (typeof e.dht1_ok !== 'undefined') ? (e.dht1_ok ? 1 : 0) : null;
+        const dht2_ok = (typeof e.dht2_ok !== 'undefined') ? (e.dht2_ok ? 1 : 0) : null;
+        const hasSensor = [t1, h1, t2, h2].some(v => v !== null && Number.isFinite(v));
+        if (!hasSensor) continue;
+        enqueueTelemetry([now, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+      }
+    }
+    return res.json({ ok: true, received: entries.length });
+  } catch (err) {
+    console.error('Batch telemetry handler error', err);
+    return res.status(500).json({ error: String(err) });
+  }
 });
 
 // Schedule endpoints: accept array of events {ts, relay, duration}
@@ -135,16 +430,38 @@ app.post('/api/schedule', (req, res) => {
     const events = req.body; // expect array
     if (!Array.isArray(events)) return res.status(400).json({ error: 'expect array of events' });
     // store into DB for persistence
-    const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
     const now = Date.now();
-    events.forEach(ev => {
-      const ets = Number(ev.ts || ev.t || 0);
-      const relay = Number(ev.relay || 1);
-      const dur = Number(ev.duration || ev.d || 0);
-      const repeat8 = ev.repeat8 ? 1 : 0;
-      if (ets > 0) stmt.run(ets, relay, dur, repeat8, now);
-    });
-    stmt.finalize();
+    if (usingPg) {
+      (async () => {
+        const client = await pgPool.connect();
+        try {
+          await client.query('BEGIN');
+          for (const ev of events) {
+            const ets = Number(ev.ts || ev.t || 0);
+            const relay = Number(ev.relay || 1);
+            const dur = Number(ev.duration || ev.d || 0);
+            const repeat8 = ev.repeat8 ? 1 : 0;
+            if (ets > 0) await client.query('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES ($1,$2,$3,$4,$5)', [ets, relay, dur, repeat8, now]);
+          }
+          await client.query('COMMIT');
+        } catch (e) {
+          await client.query('ROLLBACK');
+          console.error('PG insert schedules error', e);
+        } finally {
+          client.release();
+        }
+      })();
+    } else {
+      const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
+      events.forEach(ev => {
+        const ets = Number(ev.ts || ev.t || 0);
+        const relay = Number(ev.relay || 1);
+        const dur = Number(ev.duration || ev.d || 0);
+        const repeat8 = ev.repeat8 ? 1 : 0;
+        if (ets > 0) stmt.run(ets, relay, dur, repeat8, now);
+      });
+      stmt.finalize();
+    }
     // publish schedule to MQTT as CSV lines: ts,relay,duration\n...
     let payload = '';
     events.forEach(ev => {
@@ -189,10 +506,22 @@ app.get('/api/schedule', (req, res) => {
     })();
     return;
   }
-  db.all('SELECT id,event_ts as ts,relay,duration,repeat8,created_ts FROM schedules ORDER BY event_ts ASC LIMIT ?', [100], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.toString() });
-    res.json(rows);
-  });
+  if (usingPg) {
+    (async () => {
+      try {
+        const r = await pgPool.query('SELECT id,event_ts as ts,relay,duration,repeat8,created_ts FROM schedules ORDER BY event_ts ASC LIMIT $1', [100]);
+        return res.json(r.rows);
+      } catch (e) {
+        console.error('PG get schedules error', e);
+        return res.status(500).json({ error: e.toString() });
+      }
+    })();
+  } else {
+    db.all('SELECT id,event_ts as ts,relay,duration,repeat8,created_ts FROM schedules ORDER BY event_ts ASC LIMIT ?', [100], (err, rows) => {
+      if (err) return res.status(500).json({ error: err.toString() });
+      res.json(rows);
+    });
+  }
 });
 
 // Device schedule CSV proxy endpoints (for the ESP device to GET/POST CSV)
@@ -233,7 +562,7 @@ io.on('connection', (socket) => {
   socket.on('command', (cmd) => {
     try {
       const relay = cmd.relay;
-      const value = String(cmd.value);
+      const value = normalizeStateForDevice(cmd.value);
       const topic = `esp32s3/command/relay${relay}`;
       console.log('Publishing command to MQTT', topic, value);
       // publish and acknowledge on publish callback
@@ -256,23 +585,64 @@ io.on('connection', (socket) => {
 console.log('Connecting to MQTT broker', MQTT_BROKER);
 const client = mqtt.connect(MQTT_BROKER);
 
+client.on('error', (err) => {
+  console.error('MQTT client error', err && err.message ? err.message : err);
+});
+client.on('reconnect', () => { console.log('MQTT client reconnecting'); });
+client.on('close', () => { console.log('MQTT client closed'); });
+
 client.on('connect', () => {
   console.log('Connected to MQTT broker');
   client.subscribe(MQTT_TELEMETRY_TOPIC, { qos: 0 }, (err) => {
     if (err) console.error('Subscribe telemetry error', err);
   });
-  client.subscribe(MQTT_STATE_TOPIC, { qos: 0 }, (err) => {
-    if (err) console.error('Subscribe state error', err);
-  });
+  if (!process.env.SKIP_STATE_SUBSCRIBE) {
+    client.subscribe(MQTT_STATE_TOPIC, { qos: 0 }, (err) => {
+      if (err) console.error('Subscribe state error', err);
+    });
+  } else {
+    console.log('Skipping subscription to state topics due to SKIP_STATE_SUBSCRIBE');
+  }
   // subscribe to device-published schedule loaded notifications
   client.subscribe('esp32s3/schedule/loaded', { qos: 0 }, (err) => {
     if (err) console.error('Subscribe schedule/loaded error', err);
+  });
+  // subscribe to file responses from devices
+  client.subscribe(MQTT_FILE_RESPONSE_TOPIC, { qos: 0 }, (err) => {
+    if (err) console.error('Subscribe file response error', err);
   });
 });
 
 client.on('message', (topic, message) => {
   const payload = message.toString();
-  console.log('MQTT', topic, payload);
+  console.log(new Date().toISOString(), 'MQTT message ->', topic);
+  try {
+    // try to pretty-print JSON payloads
+    const parsed = JSON.parse(payload);
+    console.log('MQTT payload (json):', parsed);
+  } catch (e) {
+    console.log('MQTT payload (raw):', payload);
+  }
+  // File response handling: topic format esp32s3/file/response/<device_id>/<req_id>
+  if (topic.startsWith('esp32s3/file/response/')) {
+    // extract req_id
+    const parts = topic.split('/');
+    // parts[0]=esp32s3, [1]=file, [2]=response, [3]=device_id, [4]=req_id
+    const deviceId = parts[3];
+    const reqId = parts[4];
+    try {
+      const obj = JSON.parse(payload);
+      const key = `${deviceId}:${reqId}`;
+      if (pendingFileResponses[key]) {
+        pendingFileResponses[key].resolve(obj);
+        clearTimeout(pendingFileResponses[key].timer);
+        delete pendingFileResponses[key];
+      }
+    } catch (e) {
+      console.error('Invalid JSON in file response', e);
+    }
+    return;
+  }
   if (topic === MQTT_TELEMETRY_TOPIC) {
     // try to parse JSON
     let obj = payload;
@@ -280,12 +650,36 @@ client.on('message', (topic, message) => {
     // insert into sqlite DB with timestamp
     try {
       const server_ts = Date.now();
-      const device_ts = (typeof obj === 'object' && typeof obj.t !== 'undefined') ? Number(obj.t) : null;
-      const t1 = (typeof obj === 'object' && typeof obj.t1 !== 'undefined') ? Number(obj.t1) : null;
-      const h1 = (typeof obj === 'object' && typeof obj.h1 !== 'undefined') ? Number(obj.h1) : null;
-      const t2 = (typeof obj === 'object' && typeof obj.t2 !== 'undefined') ? Number(obj.t2) : null;
-      const h2 = (typeof obj === 'object' && typeof obj.h2 !== 'undefined') ? Number(obj.h2) : null;
-      db.run('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2) VALUES (?,?,?,?,?,?)', [server_ts, device_ts, t1,h1,t2,h2]);
+      const toNumberOrNull = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      const device_ts = (typeof obj === 'object' && typeof obj.t !== 'undefined') ? toNumberOrNull(obj.t) : null;
+      const t1 = (typeof obj === 'object' && typeof obj.t1 !== 'undefined') ? toNumberOrNull(obj.t1) : null;
+      const h1 = (typeof obj === 'object' && typeof obj.h1 !== 'undefined') ? toNumberOrNull(obj.h1) : null;
+      const t2 = (typeof obj === 'object' && typeof obj.t2 !== 'undefined') ? toNumberOrNull(obj.t2) : null;
+      const h2 = (typeof obj === 'object' && typeof obj.h2 !== 'undefined') ? toNumberOrNull(obj.h2) : null;
+      const dht1_ok = (typeof obj === 'object' && typeof obj.dht1_ok !== 'undefined') ? (obj.dht1_ok ? 1 : 0) : null;
+      const dht2_ok = (typeof obj === 'object' && typeof obj.dht2_ok !== 'undefined') ? (obj.dht2_ok ? 1 : 0) : null;
+      // debug: log parsed telemetry and insertion params
+      console.log('Telemetry parsed ->', { device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok });
+      // if telemetry lacks numeric sensor fields, skip DB insertion to avoid storing nulls
+      const hasSensor = [t1, h1, t2, h2].some(v => v !== null);
+      if (!hasSensor) {
+        console.log('Skipping DB insert for telemetry without sensor fields', obj);
+      } else {
+        if (usingPg) {
+          (async () => {
+            try {
+              await pgPool.query('INSERT INTO telemetry (ts,device_ts,t1,h1,t2,h2,dht1_ok,dht2_ok) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [server_ts, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+            } catch (e) { console.error('PG insert telemetry error', e); }
+          })();
+        } else {
+          // Use the serialized telemetry queue to avoid SQLITE_BUSY when concurrent writes happen.
+          console.log('Enqueue telemetry params', [server_ts, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+          enqueueTelemetry([server_ts, device_ts, t1, h1, t2, h2, dht1_ok, dht2_ok]);
+        }
+      }
     } catch (e) { console.error('Failed to insert telemetry', e); }
     io.emit('telemetry', obj);
   } else if (topic.startsWith('esp32s3/state/')) {
@@ -295,35 +689,97 @@ client.on('message', (topic, message) => {
     if (typeof relay === 'string' && relay.startsWith('relay')) {
       relay = relay.substring('relay'.length);
     }
-    // update in-memory last-known state and notify clients
-    lastRelayStates[String(relay)] = String(payload);
-    io.emit('relay-state', { relay, state: payload });
+    // normalize state, update in-memory last-known state and notify clients
+    const stateText = String(payload);
+    const publishVal = normalizeStateForDevice(stateText);
+    lastRelayStates[String(relay)] = publishVal;
+    io.emit('relay-state', { relay, state: publishVal });
+    // Persist relay state into DB (Postgres or SQLite) without re-publishing to device.
+    try {
+      const relayId = Number(relay);
+      const updatedTs = Date.now();
+      if (!Number.isFinite(relayId)) {
+        // ignore non-numeric relay identifiers
+      } else if (usingPg) {
+        (async () => {
+          try {
+            const sel = await pgPool.query('SELECT id FROM relay_states WHERE relay=$1', [relayId]);
+            if (sel.rows.length > 0) {
+              await pgPool.query('UPDATE relay_states SET state=$1, updated_ts=$2 WHERE relay=$3', [publishVal, updatedTs, relayId]);
+            } else {
+              await pgPool.query('INSERT INTO relay_states (relay, state, updated_ts) VALUES ($1,$2,$3)', [relayId, publishVal, updatedTs]);
+            }
+          } catch (e) {
+            console.error('PG relay_states upsert error', e);
+          }
+        })();
+      } else {
+        db.get('SELECT id FROM relay_states WHERE relay=?', [relayId], (err, row) => {
+          if (err) { console.error('SQLite relay_states select error', err); return; }
+          if (row) {
+            db.run('UPDATE relay_states SET state=?, updated_ts=? WHERE relay=?', [publishVal, updatedTs, relayId], (e) => { if (e) console.error('SQLite relay_states update error', e); });
+          } else {
+            db.run('INSERT INTO relay_states (relay, state, updated_ts) VALUES (?,?,?)', [relayId, publishVal, updatedTs], (e) => { if (e) console.error('SQLite relay_states insert error', e); });
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Failed to persist relay state', e);
+    }
   } else {
     // special-case: device published its loaded schedule file -> sync DB
     if (topic === 'esp32s3/schedule/loaded') {
       const csv = payload;
       console.log('Received schedule/loaded from device, syncing DB');
       // parse CSV lines: ts,relay,duration,repeat8? and replace schedules table
-      db.serialize(() => {
-        db.run('DELETE FROM schedules', (err) => {
-          if (err) console.error('Failed to clear schedules table', err);
+      if (usingPg) {
+        (async () => {
+          const clientPg = await pgPool.connect();
+          try {
+            await clientPg.query('BEGIN');
+            await clientPg.query('DELETE FROM schedules');
+            const now = Date.now();
+            const lines = csv.split(/\r?\n/);
+            for (const ln of lines) {
+              if (!ln || ln.trim().length === 0) continue;
+              const parts = ln.split(',');
+              if (parts.length < 3) continue;
+              const ets = Number(parts[0] || 0);
+              const relay = Number(parts[1] || 1);
+              const dur = Number(parts[2] || 0);
+              const repeat8 = parts.length >= 4 ? (Number(parts[3]) ? 1 : 0) : 0;
+              await clientPg.query('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES ($1,$2,$3,$4,$5)', [ets, relay, dur, repeat8, now]);
+            }
+            await clientPg.query('COMMIT');
+          } catch (e) {
+            await clientPg.query('ROLLBACK');
+            console.error('PG sync schedules error', e);
+          } finally {
+            clientPg.release();
+          }
+        })();
+      } else {
+        db.serialize(() => {
+          db.run('DELETE FROM schedules', (err) => {
+            if (err) console.error('Failed to clear schedules table', err);
+          });
+          const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
+          const now = Date.now();
+          const lines = csv.split(/\r?\n/);
+          lines.forEach((ln) => {
+            if (!ln || ln.trim().length === 0) return;
+            const parts = ln.split(',');
+            if (parts.length < 3) return;
+            const ets = Number(parts[0] || 0);
+            const relay = Number(parts[1] || 1);
+            const dur = Number(parts[2] || 0);
+            const repeat8 = parts.length >= 4 ? (Number(parts[3]) ? 1 : 0) : 0;
+            // store epoch ms if looks like large number (>1e12) else store as relative ts
+            stmt.run(ets, relay, dur, repeat8, now);
+          });
+          stmt.finalize();
         });
-        const stmt = db.prepare('INSERT INTO schedules (event_ts, relay, duration, repeat8, created_ts) VALUES (?,?,?,?,?)');
-        const now = Date.now();
-        const lines = csv.split(/\r?\n/);
-        lines.forEach((ln) => {
-          if (!ln || ln.trim().length === 0) return;
-          const parts = ln.split(',');
-          if (parts.length < 3) return;
-          const ets = Number(parts[0] || 0);
-          const relay = Number(parts[1] || 1);
-          const dur = Number(parts[2] || 0);
-          const repeat8 = parts.length >= 4 ? (Number(parts[3]) ? 1 : 0) : 0;
-          // store epoch ms if looks like large number (>1e12) else store as relative ts
-          stmt.run(ets, relay, dur, repeat8, now);
-        });
-        stmt.finalize();
-      });
+      }
       // also emit mqtt event to web clients so UI can react if needed
       io.emit('mqtt', { topic, payload });
     } else {
@@ -337,8 +793,9 @@ client.on('message', (topic, message) => {
 app.post('/api/command', (req, res) => {
   try {
     const relay = req.body.relay;
-    const value = String(req.body.value);
-    if (typeof relay === 'undefined' || typeof value === 'undefined') return res.status(400).json({ error: 'relay and value required' });
+    const rawValue = req.body.value;
+    if (typeof relay === 'undefined' || typeof rawValue === 'undefined') return res.status(400).json({ error: 'relay and value required' });
+    const value = normalizeStateForDevice(rawValue);
     const topic = `esp32s3/command/relay${relay}`;
     console.log('HTTP test publish', topic, value);
     client.publish(topic, value, { qos: 0 }, (err) => {
@@ -351,6 +808,96 @@ app.post('/api/command', (req, res) => {
   } catch (e) {
     console.error('HTTP /api/command error', e);
     res.status(500).json({ error: e.toString() });
+  }
+});
+
+// Debug endpoint: emit arbitrary telemetry to connected web clients (not for production)
+app.post('/_debug/emit', (req, res) => {
+  try {
+    const payload = req.body || {};
+    io.emit('telemetry', payload);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Debug emit failed', e);
+    return res.status(500).json({ error: e.toString() });
+  }
+});
+
+// Relay states API
+app.get('/api/relay_states', (req, res) => {
+  if (usingPg) {
+    (async () => {
+      try {
+        const r = await pgPool.query('SELECT relay, state, updated_ts FROM relay_states ORDER BY relay');
+        return res.json(r.rows);
+      } catch (e) {
+        console.error('PG get relay_states error', e);
+        return res.status(500).json({ error: e.toString() });
+      }
+    })();
+  } else {
+    db.all('SELECT relay, state, updated_ts FROM relay_states ORDER BY relay', [], (err, rows) => {
+      if (err) {
+        console.error('SQLite get relay_states error', err);
+        return res.status(500).json({ error: err.toString() });
+      }
+      res.json(rows);
+    });
+  }
+});
+
+app.get('/api/relay_states/:relay', (req, res) => {
+  const relayId = Number(req.params.relay);
+  if (!Number.isFinite(relayId)) return res.status(400).json({ error: 'invalid relay id' });
+  if (usingPg) {
+    (async () => {
+      try {
+        const r = await pgPool.query('SELECT relay, state, updated_ts FROM relay_states WHERE relay=$1 LIMIT 1', [relayId]);
+        if (r.rows.length === 0) return res.status(404).json({});
+        return res.json(r.rows[0]);
+      } catch (e) {
+        console.error('PG get relay_state error', e);
+        return res.status(500).json({ error: e.toString() });
+      }
+    })();
+  } else {
+    db.get('SELECT relay, state, updated_ts FROM relay_states WHERE relay=? LIMIT 1', [relayId], (err, row) => {
+      if (err) {
+        console.error('SQLite get relay_state error', err);
+        return res.status(500).json({ error: err.toString() });
+      }
+      if (!row) return res.status(404).json({});
+      res.json(row);
+    });
+  }
+});
+
+// Create or update relay state (upsert-like)
+app.post('/api/relay_states', async (req, res) => {
+  const relayId = Number(req.body.relay);
+  const stateText = String(req.body.state || '');
+  if (!Number.isFinite(relayId) || !stateText) return res.status(400).json({ error: 'relay and state required' });
+  const publishVal = normalizeStateForDevice(stateText);
+  try {
+    await upsertRelayState(relayId, publishVal, { publishToDevice: true });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('upsertRelayState error', e);
+    return res.status(500).json({ error: e.toString() });
+  }
+});
+
+app.put('/api/relay_states/:relay', async (req, res) => {
+  const relayId = Number(req.params.relay);
+  const stateText = String(req.body.state || '');
+  if (!Number.isFinite(relayId) || !stateText) return res.status(400).json({ error: 'relay and state required' });
+  const publishVal = normalizeStateForDevice(stateText);
+  try {
+    await upsertRelayState(relayId, publishVal, { publishToDevice: true });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('PUT upsert error', e);
+    return res.status(500).json({ error: e.toString() });
   }
 });
 
